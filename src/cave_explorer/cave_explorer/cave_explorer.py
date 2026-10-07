@@ -218,6 +218,9 @@ INSPECTION_DUPLICATE_RADIUS_M = 3.0
 # and holding position, when looking for one that's actually navigable (see is_point_navigable()).
 RANDOM_WALK_MAX_ATTEMPTS = 30
 
+# How often (seconds) to print the [STATUS] heartbeat - see log_status().
+STATUS_LOG_PERIOD_S = 30.0
+
 # Planning 1/3 robustness: Nav2's own recovery behaviour tree can retry a difficult goal (e.g.
 # "Failed to make progress") more or less indefinitely without ever reporting success or
 # failure back to us. If a goal hasn't finished within this many seconds, we give up on it
@@ -339,6 +342,10 @@ class CaveExplorer(Node):
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
+
+        # Periodic status heartbeat (elapsed time + progress counts) - see log_status()
+        self.start_time_ = self.get_clock().now()
+        self.status_timer_ = self.create_timer(STATUS_LOG_PERIOD_S, self.log_status)
     
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
@@ -434,10 +441,9 @@ class CaveExplorer(Node):
         self.image_detections_pub_.publish(image_detection_message)
 
         if self.artifact_found_:
-            # Fires on nearly every camera frame when something's in view, so throttle it -
-            # otherwise it drowns out every other log line (sent goals, inspection results...)
-            self.get_logger().info(
-                f'Artifact(s) found: {[d.label for d in detections]}', throttle_duration_sec=3.0)
+            # No per-frame log here - it fires on nearly every camera frame when something's
+            # in view, which drowned out every other log line. add_artifact_observation()
+            # below logs each genuinely NEW artefact once, which is the useful signal.
             self.localise_artifacts(detections)
 
     def depth_image_callback(self, image_msg):
@@ -623,6 +629,8 @@ class CaveExplorer(Node):
             'position': Point(x=position.x, y=position.y, z=position.z),
             'num_observations': 1,
         })
+        self.get_logger().info(
+            f'[DISCOVER] {label} #{cluster_id} at ({position.x:.1f}, {position.y:.1f})')
 
     def publish_artifact_markers(self):
         """Perception 3: publish one coloured sphere + text label per clustered artefact estimate"""
@@ -1032,7 +1040,7 @@ class CaveExplorer(Node):
         generation = self.goal_generation_
         self.goal_sent_time_ = self.get_clock().now()
 
-        self.get_logger().warn(f'Sending goal [{pose2d.x:.2f}, {pose2d.y:.2f}]...')
+        self.get_logger().info(f'  -> goal ({pose2d.x:.2f}, {pose2d.y:.2f})')
         self.send_goal_future_ = self.nav2_action_client_.send_goal_async(
             action_goal,
             feedback_callback=feedback_method)
@@ -1047,13 +1055,12 @@ class CaveExplorer(Node):
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error('Goal rejected')
+            self.get_logger().info('  <- rejected')
             self.last_goal_succeeded_ = False
             self.ready_for_next_goal_ = True
             return
 
         # Goal accepted: get result when it's completed
-        self.get_logger().warn(f'Goal accepted')
         self.get_result_future_ = goal_handle.get_result_async()
         self.get_result_future_.add_done_callback(
             functools.partial(self.goal_reached_callback, generation=generation))
@@ -1074,9 +1081,9 @@ class CaveExplorer(Node):
         status = future.result().status
         self.last_goal_succeeded_ = (status == GoalStatus.STATUS_SUCCEEDED)
         if self.last_goal_succeeded_:
-            self.get_logger().info('Goal reached!')
+            self.get_logger().info('  <- reached')
         else:
-            self.get_logger().warn(f'Goal did not succeed (status={status})')
+            self.get_logger().info(f'  <- failed (status={status})')
         self.ready_for_next_goal_ = True
 
 
@@ -1199,8 +1206,7 @@ class CaveExplorer(Node):
         if not self.ready_for_next_goal_ and self.goal_sent_time_ is not None:
             elapsed_s = (self.get_clock().now() - self.goal_sent_time_).nanoseconds / 1e9
             if elapsed_s > GOAL_TIMEOUT_S:
-                self.get_logger().warn(
-                    f'Goal timed out after {elapsed_s:.0f}s with no result - abandoning it')
+                self.get_logger().info(f'[GOAL]   <- timed out after {elapsed_s:.0f}s, abandoning')
                 self.last_goal_succeeded_ = False
                 self.ready_for_next_goal_ = True
                 self.goal_sent_time_ = None
@@ -1257,7 +1263,7 @@ class CaveExplorer(Node):
         #######################################################
         # Execute the planner by calling the relevant method
         # Add your own planners here!
-        self.get_logger().info(f'Calling planner: {self.planner_type_.name}')
+        self.get_logger().info(f'[GOAL] {self.planner_type_.name}')
         if self.planner_type_ == PlannerType.MOVE_FORWARDS:
             self.planner_move_forwards(10)
         elif self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
@@ -1278,6 +1284,19 @@ class CaveExplorer(Node):
 
 
         #######################################################
+
+    def log_status(self):
+        """Periodic [STATUS] heartbeat: elapsed time, current mode, and progress counts"""
+
+        elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
+        inspectable = [c for c in self.artifact_clusters_ if c['label'] in INSPECTION_ARTIFACT_LABELS]
+        visited = len(self.visited_artifact_ids_)
+        abandoned = len(self.abandoned_artifact_ids_)
+        pending = len(inspectable) - visited - abandoned
+
+        self.get_logger().info(
+            f'[STATUS] t={elapsed_s:.0f}s | mode={self.planner_type_.name} | '
+            f'artefacts: visited={visited} abandoned={abandoned} pending={pending}')
 
 def main():
     # Initialise
