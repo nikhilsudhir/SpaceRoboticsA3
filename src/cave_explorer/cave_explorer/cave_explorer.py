@@ -167,13 +167,23 @@ ARTIFACT_CLUSTER_DISTANCE_M = 1.5
 # Planning 1: frontier-based exploration.
 # Occupancy grid cells >= this value are treated as occupied (cells are 0-100, or -1 if unknown).
 FRONTIER_OCCUPIED_THRESHOLD = 50
-# Frontier clusters smaller than this many cells are treated as noise and ignored.
-FRONTIER_MIN_CLUSTER_SIZE = 6
-# Candidate frontiers within this distance (metres) of a recently sent goal are skipped, so we
-# don't repeatedly re-target the same spot (e.g. if Nav2 can't quite reach the frontier itself).
-FRONTIER_REVISIT_RADIUS_M = 3.0
-# How many recent frontier goals to remember for the revisitation check above.
-FRONTIER_REVISIT_HISTORY = 15
+# Frontier clusters smaller than this many cells are treated as noise and ignored. Raised from
+# an earlier, smaller value: tiny clusters are usually just sensor-shadow slivers (behind a
+# rock, a corner the lidar grazed) right next to already-explored corridors, not real
+# unexplored territory - letting those count as frontiers was the main cause of the robot
+# "mopping up" small scraps near where it'd already been instead of pushing into new areas.
+FRONTIER_MIN_CLUSTER_SIZE = 15
+# How far (metres) a frontier's score is allowed to "travel" before distance starts
+# significantly discounting it - see choose_frontier_goal()'s score formula. Larger means
+# distance matters less relative to size, so a big far frontier can still beat a tiny close one.
+FRONTIER_DISTANCE_SCALE_M = 5.0
+# Candidate frontiers within this distance (metres) of a goal we've ever sent before are
+# skipped, so we don't repeatedly re-target the same spot (e.g. if Nav2 can't quite reach the
+# frontier itself, or a sensor-shadow sliver flickers in and out near a path we've already
+# driven). Unlike a short-lived "recent goals" window, recent_frontier_goals_ is never
+# truncated - every frontier goal from the whole run is remembered, so the robot can't forget
+# it was already here and go back after enough time/goals have passed.
+FRONTIER_REVISIT_RADIUS_M = 4.0
 
 # Planning 1: after this many consecutive checks with a real map available but no frontier
 # candidates found, treat exploration as complete (rather than a one-off gap) and say so
@@ -234,8 +244,8 @@ class CaveExplorer(Node):
         # Variables/Flags for planning
         self.planner_type_ = PlannerType.ERROR
 
-        # Planning 1: world-frame (x, y) of the last few frontier goals sent, so we can avoid
-        # immediately re-targeting the same spot (e.g. if Nav2 can't quite reach a frontier).
+        # Planning 1: world-frame (x, y) of every frontier goal ever sent this run, so we never
+        # re-target the same spot - see FRONTIER_REVISIT_RADIUS_M's comment above.
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
         # Planning 1: consecutive ticks with a real map but no frontier candidates - see
@@ -752,10 +762,13 @@ class CaveExplorer(Node):
         """
         Planning 1: pick the best frontier cluster to explore next.
 
-        Score = cluster size / (1 + distance from robot): prefers larger frontiers (more new
-        area to reveal) that are also closer (cheaper to reach). Clusters smaller than
-        FRONTIER_MIN_CLUSTER_SIZE are dropped as likely noise, and clusters too close to a
-        recently sent goal are skipped (revisitation avoidance).
+        Score = cluster size / (1 + distance / FRONTIER_DISTANCE_SCALE_M): prefers larger
+        frontiers (more new area to reveal), with distance as a secondary tiebreaker rather
+        than a dominant factor - so a big far frontier can still beat a tiny close one, which
+        matters because small clusters near already-explored corridors are usually just
+        sensor-shadow slivers, not real new territory. Clusters smaller than
+        FRONTIER_MIN_CLUSTER_SIZE are dropped as likely noise, and clusters near any
+        previously-sent goal are skipped (revisitation avoidance).
 
         Returns (chosen, candidates): 'chosen' is the best candidate dict (or None if none are
         valid), 'candidates' is every candidate considered (for visualisation).
@@ -781,7 +794,7 @@ class CaveExplorer(Node):
                 continue
 
             distance = math.hypot(world_x - robot_pose.x, world_y - robot_pose.y)
-            score = len(cluster) / (1.0 + distance)
+            score = len(cluster) / (1.0 + distance / FRONTIER_DISTANCE_SCALE_M)
             candidates.append({
                 'position': (world_x, world_y),
                 'size': len(cluster),
@@ -870,9 +883,8 @@ class CaveExplorer(Node):
         theta = math.atan2(goal_y - robot_pose.y, goal_x - robot_pose.x)
         goal_pose2d = Pose2D(x=goal_x, y=goal_y, theta=theta)
 
+        # Never evicted - see FRONTIER_REVISIT_RADIUS_M's comment for why
         self.recent_frontier_goals_.append((goal_x, goal_y))
-        if len(self.recent_frontier_goals_) > FRONTIER_REVISIT_HISTORY:
-            self.recent_frontier_goals_.pop(0)
 
         self.planner_go_to_pose2d(goal_pose2d)
 
