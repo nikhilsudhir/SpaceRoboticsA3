@@ -57,6 +57,7 @@ class PlannerType(Enum):
     RANDOM_WALK = 4
     RANDOM_GOAL = 5
     EXPLORE_FRONTIER = 6
+    INSPECT_ARTIFACT = 7
     # Add more!
 
 
@@ -172,6 +173,15 @@ FRONTIER_REVISIT_RADIUS_M = 3.0
 # How many recent frontier goals to remember for the revisitation check above.
 FRONTIER_REVISIT_HISTORY = 15
 
+# Planning 2: artefact types the robot will pause exploration to inspect up close. Chosen as
+# the 3 most visually distinct profiles in ARTIFACT_COLOR_PROFILES (per that list's own
+# comments, e.g. green_alien/toy_story_alien and white_sphere/ice_formation are more likely
+# to be confused with each other, so are left out).
+INSPECTION_ARTIFACT_LABELS = ['blue_cube', 'white_sphere', 'green_crystals']
+
+# Planning 2: distance (metres) to stop from an artefact for close-range inspection.
+INSPECTION_STANDOFF_DISTANCE_M = 2.0
+
 
 class CaveExplorer(Node):
     def __init__(self):
@@ -200,6 +210,10 @@ class CaveExplorer(Node):
         # immediately re-targeting the same spot (e.g. if Nav2 can't quite reach a frontier).
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
+
+        # Planning 2: the artefact cluster currently being approached for close-range
+        # inspection (a snapshot dict from artifact_clusters_), or None if not inspecting.
+        self.inspection_target_ = None
 
         # Perception 3: clustered artefact location estimates.
         # Each entry is a dict: {'label': str, 'position': Point, 'num_observations': int}
@@ -757,6 +771,45 @@ class CaveExplorer(Node):
 
         self.planner_go_to_pose2d(goal_pose2d)
 
+    def find_inspection_target(self):
+        """
+        Planning 2: return the first known artefact cluster of a chosen type (see
+        INSPECTION_ARTIFACT_LABELS) available for close-range inspection, or None.
+        """
+
+        for cluster in self.artifact_clusters_:
+            if cluster['label'] in INSPECTION_ARTIFACT_LABELS:
+                return cluster
+        return None
+
+    def planner_inspect_artifact(self):
+        """
+        Planning 2: navigate to a close-range standoff viewpoint of self.inspection_target_,
+        approaching from the robot's current side (so the path there is short and obstacle-free)
+        and facing the artefact once there.
+        """
+
+        robot_pose = self.get_pose_2d()
+        if robot_pose is None or self.inspection_target_ is None:
+            return
+
+        target = self.inspection_target_['position']
+        dx = robot_pose.x - target.x
+        dy = robot_pose.y - target.y
+        distance = math.hypot(dx, dy)
+        if distance < 1e-3:
+            # Degenerate case: robot is (almost) exactly on top of the artefact - pick an
+            # arbitrary approach direction rather than dividing by ~0 below
+            dx, dy, distance = 1.0, 0.0, 1.0
+
+        # Standoff point: INSPECTION_STANDOFF_DISTANCE_M from the artefact, back along the
+        # line towards the robot's current position
+        goal_x = target.x + dx / distance * INSPECTION_STANDOFF_DISTANCE_M
+        goal_y = target.y + dy / distance * INSPECTION_STANDOFF_DISTANCE_M
+        theta = math.atan2(target.y - goal_y, target.x - goal_x)  # face the artefact
+
+        self.planner_go_to_pose2d(Pose2D(x=goal_x, y=goal_y, theta=theta))
+
     def planner_go_to_pose2d(self, pose2d):
         """Go to a provided 2d pose"""
 
@@ -916,9 +969,15 @@ class CaveExplorer(Node):
         #######################################################
         # Select the next planner to execute
         # Planning 1: continuously explore via frontiers (see planner_explore_frontier()).
-        # Planning 2/3 will extend this to switch into close-range inspection when an
-        # artefact of interest is detected.
-        self.planner_type_ = PlannerType.EXPLORE_FRONTIER
+        # Planning 2: pause exploration and approach a chosen-type artefact for close-range
+        # inspection as soon as one is known. (Planning 3 extends this with visited-tracking,
+        # so each artefact is only inspected once, and a timeout/retry/resume-exploring flow.)
+        inspection_target = self.find_inspection_target()
+        if inspection_target is not None:
+            self.inspection_target_ = inspection_target
+            self.planner_type_ = PlannerType.INSPECT_ARTIFACT
+        else:
+            self.planner_type_ = PlannerType.EXPLORE_FRONTIER
 
         #######################################################
         # Execute the planner by calling the relevant method
@@ -936,6 +995,8 @@ class CaveExplorer(Node):
             self.planner_random_goal()
         elif self.planner_type_ == PlannerType.EXPLORE_FRONTIER:
             self.planner_explore_frontier()
+        elif self.planner_type_ == PlannerType.INSPECT_ARTIFACT:
+            self.planner_inspect_artifact()
         else:
             self.get_logger().error('No valid planner selected')
             self.destroy_node()
