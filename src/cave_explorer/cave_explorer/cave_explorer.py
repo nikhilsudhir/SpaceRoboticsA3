@@ -786,8 +786,11 @@ class CaveExplorer(Node):
         self.publish_frontier_markers(chosen, candidates)
 
         if chosen is None:
-            self.get_logger().info('No frontiers left to explore - falling back to random goals')
-            self.planner_random_goal()
+            # planner_random_walk() samples directly from the current map bounds, so (unlike
+            # planner_random_goal()'s fixed coordinate list) it always finds a valid point even
+            # very early on (e.g. before the first map message arrives) or on an unfamiliar map
+            self.get_logger().info('No frontiers to explore right now - taking a random step')
+            self.planner_random_walk()
             return
 
         goal_x, goal_y = chosen['position']
@@ -994,19 +997,20 @@ class CaveExplorer(Node):
                         [7.9, 13.8],
                         [14.2, 37.7]]
 
-        # Select a random location
+        # Select a random location, trying each candidate at most once (rather than looping
+        # forever) in case none of them currently fall within the map bounds - e.g. early on,
+        # before enough of the map has been seen for any of this hardcoded list to be in range
         goal_valid = False
-        while not goal_valid:
-            idx = random.randint(0,len(random_goals)-1)
-            goal_x = random_goals[idx][0]
-            goal_y = random_goals[idx][1]
-
-            # Only accept this goal if it's within the current costmap bounds
-            if goal_x > self.xlim_[0] and goal_x < self.xlim_[1] and \
-               goal_y > self.ylim_[0] and goal_y < self.ylim_[1]:
+        for goal_x, goal_y in random.sample(random_goals, len(random_goals)):
+            if self.xlim_[0] < goal_x < self.xlim_[1] and self.ylim_[0] < goal_y < self.ylim_[1]:
                 goal_valid = True
-            else:
-                self.get_logger().warn(f'Goal [{goal_x}, {goal_y}] out of bounds')
+                break
+            self.get_logger().warn(f'Goal [{goal_x}, {goal_y}] out of bounds')
+
+        if not goal_valid:
+            self.get_logger().warn('No random goal currently within map bounds - skipping this cycle')
+            self.ready_for_next_goal_ = True
+            return
 
         goal_pose2d = Pose2D(
             x = goal_x,
