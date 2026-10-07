@@ -10,6 +10,7 @@ import cv2  # OpenCV2
 import numpy as np
 import rclpy
 import tf2_geometry_msgs
+from action_msgs.msg import GoalStatus
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped
 from nav2_msgs.action import NavigateToPose
@@ -182,6 +183,11 @@ INSPECTION_ARTIFACT_LABELS = ['blue_cube', 'white_sphere', 'green_crystals']
 # Planning 2: distance (metres) to stop from an artefact for close-range inspection.
 INSPECTION_STANDOFF_DISTANCE_M = 2.0
 
+# Planning 3: if a close-range inspection goal doesn't succeed (Nav2 aborts/rejects it - e.g.
+# the artefact's standoff point turned out to be unreachable), retry it this many times before
+# abandoning that artefact and resuming exploration.
+INSPECTION_MAX_RETRIES = 1
+
 
 class CaveExplorer(Node):
     def __init__(self):
@@ -211,14 +217,30 @@ class CaveExplorer(Node):
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
 
-        # Planning 2: the artefact cluster currently being approached for close-range
-        # inspection (a snapshot dict from artifact_clusters_), or None if not inspecting.
+        # Planning 2/3: the artefact cluster currently being approached for close-range
+        # inspection (a dict from artifact_clusters_), or None if not inspecting.
         self.inspection_target_ = None
+        # Planning 3: ids of artefact clusters already successfully inspected, so each is
+        # only visited once, and ids abandoned after repeated failed approach attempts (kept
+        # separate from visited_ so the report can distinguish the two; both are excluded from
+        # future targeting by find_inspection_target(), otherwise an unreachable artefact would
+        # be retried forever instead of actually resuming exploration). Also: how many approach
+        # attempts made for the current target so far (see INSPECTION_MAX_RETRIES), and whether
+        # the most recently completed Nav2 goal succeeded (set by goal_response_callback/
+        # goal_reached_callback below).
+        self.visited_artifact_ids_ = set()
+        self.abandoned_artifact_ids_ = set()
+        self.inspection_attempts_ = 0
+        self.last_goal_succeeded_ = None
+        self.visited_markers_pub_ = self.create_publisher(
+            MarkerArray, 'artifact_inspection_status_markers', 1)
 
         # Perception 3: clustered artefact location estimates.
-        # Each entry is a dict: {'label': str, 'position': Point, 'num_observations': int}
+        # Each entry is a dict: {'id': int, 'label': str, 'position': Point, 'num_observations': int}
         # 'position' is a running average over all observations merged into this cluster.
+        # 'id' (Planning 3) is a stable identity for this cluster, used for visited-tracking.
         self.artifact_clusters_ = []
+        self.next_artifact_cluster_id_ = 0
         self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
 
         # Initialise CvBridge
@@ -542,7 +564,14 @@ class CaveExplorer(Node):
                 cluster['num_observations'] += 1
                 return
 
+        # Planning 3: a stable id per cluster (distinct from its position in the list, which
+        # isn't guaranteed to stay fixed), used to track which specific artefacts have
+        # already been inspected - see visited_artifact_ids_.
+        cluster_id = self.next_artifact_cluster_id_
+        self.next_artifact_cluster_id_ += 1
+
         self.artifact_clusters_.append({
+            'id': cluster_id,
             'label': label,
             'position': Point(x=position.x, y=position.y, z=position.z),
             'num_observations': 1,
@@ -773,14 +802,53 @@ class CaveExplorer(Node):
 
     def find_inspection_target(self):
         """
-        Planning 2: return the first known artefact cluster of a chosen type (see
-        INSPECTION_ARTIFACT_LABELS) available for close-range inspection, or None.
+        Planning 2/3: return the first known artefact cluster of a chosen type (see
+        INSPECTION_ARTIFACT_LABELS) that hasn't already been inspected or abandoned, or None.
         """
 
         for cluster in self.artifact_clusters_:
-            if cluster['label'] in INSPECTION_ARTIFACT_LABELS:
+            if cluster['label'] in INSPECTION_ARTIFACT_LABELS \
+                    and cluster['id'] not in self.visited_artifact_ids_ \
+                    and cluster['id'] not in self.abandoned_artifact_ids_:
                 return cluster
         return None
+
+    def publish_visited_artifact_markers(self):
+        """
+        Planning 3: overlay a small flag above each inspectable-type artefact (see
+        INSPECTION_ARTIFACT_LABELS) showing its inspection status: visited (green),
+        abandoned after repeated failed attempts (orange), or still pending (red).
+        """
+
+        marker_array = MarkerArray()
+        for cluster in self.artifact_clusters_:
+            if cluster['label'] not in INSPECTION_ARTIFACT_LABELS:
+                continue
+
+            if cluster['id'] in self.visited_artifact_ids_:
+                color = (0.0, 1.0, 0.0)
+            elif cluster['id'] in self.abandoned_artifact_ids_:
+                color = (1.0, 0.6, 0.0)
+            else:
+                color = (1.0, 0.0, 0.0)
+
+            flag = Marker()
+            flag.header.frame_id = 'map'
+            flag.ns = 'artifact_inspection_status'
+            flag.id = cluster['id']
+            flag.type = Marker.CYLINDER
+            flag.action = Marker.ADD
+            flag.pose.position.x = cluster['position'].x
+            flag.pose.position.y = cluster['position'].y
+            flag.pose.position.z = cluster['position'].z + 0.9
+            flag.pose.orientation.w = 1.0
+            flag.scale.x = flag.scale.y = 0.25
+            flag.scale.z = 0.08
+            flag.color.a = 1.0
+            flag.color.r, flag.color.g, flag.color.b = color
+            marker_array.markers.append(flag)
+
+        self.visited_markers_pub_.publish(marker_array)
 
     def planner_inspect_artifact(self):
         """
@@ -841,6 +909,7 @@ class CaveExplorer(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error('Goal rejected')
+            self.last_goal_succeeded_ = False
             self.ready_for_next_goal_ = True
             return
 
@@ -857,10 +926,14 @@ class CaveExplorer(Node):
         self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
 
     def goal_reached_callback(self, future):
-        """The requested goal has been reached"""
+        """The requested goal has finished (successfully or not)"""
 
-        result = future.result().result
-        self.get_logger().info(f'Goal reached!')
+        status = future.result().status
+        self.last_goal_succeeded_ = (status == GoalStatus.STATUS_SUCCEEDED)
+        if self.last_goal_succeeded_:
+            self.get_logger().info('Goal reached!')
+        else:
+            self.get_logger().warn(f'Goal did not succeed (status={status})')
         self.ready_for_next_goal_ = True
 
 
@@ -968,13 +1041,42 @@ class CaveExplorer(Node):
 
         #######################################################
         # Select the next planner to execute
-        # Planning 1: continuously explore via frontiers (see planner_explore_frontier()).
+        #
+        # Planning 1: explore via frontiers by default (see planner_explore_frontier()).
         # Planning 2: pause exploration and approach a chosen-type artefact for close-range
-        # inspection as soon as one is known. (Planning 3 extends this with visited-tracking,
-        # so each artefact is only inspected once, and a timeout/retry/resume-exploring flow.)
-        inspection_target = self.find_inspection_target()
-        if inspection_target is not None:
-            self.inspection_target_ = inspection_target
+        # inspection when one is known (see planner_inspect_artifact()).
+        # Planning 3: switch between the two - each artefact is only inspected once
+        # (visited_artifact_ids_), and a failed approach (Nav2 couldn't complete the goal -
+        # the closest signal we have to "lost the artefact") is retried once before
+        # abandoning that artefact and resuming exploration.
+        if self.planner_type_ == PlannerType.INSPECT_ARTIFACT:
+            # The previous tick's approach goal (for self.inspection_target_) just finished
+            if self.last_goal_succeeded_:
+                self.get_logger().info(
+                    f"Inspected '{self.inspection_target_['label']}' "
+                    f"(id={self.inspection_target_['id']})")
+                self.visited_artifact_ids_.add(self.inspection_target_['id'])
+                self.inspection_target_ = None
+                self.inspection_attempts_ = 0
+            else:
+                self.inspection_attempts_ += 1
+                if self.inspection_attempts_ > INSPECTION_MAX_RETRIES:
+                    self.get_logger().warn(
+                        f"Abandoning '{self.inspection_target_['label']}' "
+                        f"(id={self.inspection_target_['id']}) after "
+                        f"{self.inspection_attempts_} failed attempt(s)")
+                    self.abandoned_artifact_ids_.add(self.inspection_target_['id'])
+                    self.inspection_target_ = None
+                    self.inspection_attempts_ = 0
+                # else: inspection_target_ stays set, so it's retried below
+
+        self.publish_visited_artifact_markers()
+
+        if self.inspection_target_ is None:
+            self.inspection_target_ = self.find_inspection_target()
+            self.inspection_attempts_ = 0
+
+        if self.inspection_target_ is not None:
             self.planner_type_ = PlannerType.INSPECT_ARTIFACT
         else:
             self.planner_type_ = PlannerType.EXPLORE_FRONTIER
