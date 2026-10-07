@@ -189,6 +189,16 @@ INSPECTION_STANDOFF_DISTANCE_M = 2.0
 # abandoning that artefact and resuming exploration.
 INSPECTION_MAX_RETRIES = 1
 
+# Planning 3 robustness: Perception 3's clustering (ARTIFACT_CLUSTER_DISTANCE_M) can
+# over-segment one physical artefact into several same-label clusters if repeated
+# localisation estimates for it land further apart than that threshold (observed with the
+# colour-blob detector, especially at close range where many detections arrive per second).
+# A same-label cluster within this distance of one we've already visited/abandoned is treated
+# as the same physical object rather than a new one, so we don't keep "rediscovering" and
+# re-approaching it under a new id. Deliberately wider than ARTIFACT_CLUSTER_DISTANCE_M (1.5m)
+# to absorb that drift, while still being tighter than the spacing between distinct artefacts.
+INSPECTION_DUPLICATE_RADIUS_M = 3.0
+
 # Planning 1/3 robustness: Nav2's own recovery behaviour tree can retry a difficult goal (e.g.
 # "Failed to make progress") more or less indefinitely without ever reporting success or
 # failure back to us. If a goal hasn't finished within this many seconds, we give up on it
@@ -853,11 +863,32 @@ class CaveExplorer(Node):
         """
 
         for cluster in self.artifact_clusters_:
-            if cluster['label'] in INSPECTION_ARTIFACT_LABELS \
-                    and cluster['id'] not in self.visited_artifact_ids_ \
-                    and cluster['id'] not in self.abandoned_artifact_ids_:
-                return cluster
+            if cluster['label'] not in INSPECTION_ARTIFACT_LABELS:
+                continue
+            if cluster['id'] in self.visited_artifact_ids_ or cluster['id'] in self.abandoned_artifact_ids_:
+                continue
+            if self.is_duplicate_of_handled_artifact(cluster):
+                # Treat it as the same physical artefact as one we've already dealt with (see
+                # INSPECTION_DUPLICATE_RADIUS_M) - mark it visited too, so this id (and any
+                # future ones that spawn near it) won't keep coming back as a "new" target
+                self.visited_artifact_ids_.add(cluster['id'])
+                continue
+            return cluster
         return None
+
+    def is_duplicate_of_handled_artifact(self, cluster):
+        """Planning 3: is 'cluster' suspiciously close to a same-label cluster already handled?"""
+
+        handled_ids = self.visited_artifact_ids_ | self.abandoned_artifact_ids_
+        for other in self.artifact_clusters_:
+            if other['id'] == cluster['id'] or other['id'] not in handled_ids \
+                    or other['label'] != cluster['label']:
+                continue
+            dx = cluster['position'].x - other['position'].x
+            dy = cluster['position'].y - other['position'].y
+            if math.hypot(dx, dy) < INSPECTION_DUPLICATE_RADIUS_M:
+                return True
+        return False
 
     def publish_visited_artifact_markers(self):
         """
