@@ -349,10 +349,8 @@ class CaveExplorer(Node):
 
         if qz >= 0.:
             pose.theta = wrap_angle(2. * math.acos(qw))
-        else: 
+        else:
             pose.theta = wrap_angle(-2. * math.acos(qw))
-
-        self.get_logger().warn(f'Pose: {pose}')
 
         return pose
 
@@ -422,7 +420,10 @@ class CaveExplorer(Node):
         self.image_detections_pub_.publish(image_detection_message)
 
         if self.artifact_found_:
-            self.get_logger().info(f'Artifact(s) found: {[d.label for d in detections]}')
+            # Fires on nearly every camera frame when something's in view, so throttle it -
+            # otherwise it drowns out every other log line (sent goals, inspection results...)
+            self.get_logger().info(
+                f'Artifact(s) found: {[d.label for d in detections]}', throttle_duration_sec=3.0)
             self.localise_artifacts(detections)
 
     def depth_image_callback(self, image_msg):
