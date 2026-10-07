@@ -128,6 +128,15 @@ ros2 service call /save_dataset_image std_srvs/srv/Trigger {}
 
 Drive the robot around (random walk/goals, waypoints, or teleop — see Perception 1 in the project brief) while this is running, then sort the saved images into per-artefact-type folders afterwards.
 
+### Autonomous exploration and artefact inspection (Planning 1–3)
+
+Once all three launch files are running, the robot explores and inspects artefacts fully autonomously — no manual goals needed. In RViz:
+
+- **`frontier_markers`** (Planning 1) — yellow points are candidate exploration frontiers (free cells bordering unknown space, clustered), the red sphere is the one currently chosen. The robot heads there, then re-evaluates once it arrives (or the goal fails).
+- **`artifact_inspection_status_markers`** (Planning 3) — a small flag above each inspectable artefact: **red** = not yet inspected, **green** = successfully inspected, **orange** = abandoned after repeated failed approach attempts.
+
+Only `blue_cube`, `white_sphere`, and `green_crystals` (`INSPECTION_ARTIFACT_LABELS` in `cave_explorer.py`) trigger close-range inspection — these were judged the most visually distinct of Perception 2's colour profiles. When one is detected, the robot pauses exploring, navigates to a standoff viewpoint (`INSPECTION_STANDOFF_DISTANCE_M`, default 2 m) facing it, then resumes exploring. A failed approach is retried once (`INSPECTION_MAX_RETRIES`) before being abandoned.
+
 ## Development notes
 
 - The `cave_explorer` console script is registered as an entry point in [`setup.py`](src/cave_explorer/setup.py) and maps to `main()` in `cave_explorer/cave_explorer.py`.
