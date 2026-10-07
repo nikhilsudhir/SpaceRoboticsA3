@@ -258,6 +258,13 @@ class CaveExplorer(Node):
         # Planning 1: consecutive ticks with a real map but no frontier candidates - see
         # EXPLORATION_COMPLETE_STREAK and planner_explore_frontier().
         self.no_frontier_streak_ = 0
+        # Set once the cave is fully mapped (sticky - never reset back to False). Once true
+        # and every known artefact is visited/abandoned, main_loop sends the robot home
+        # instead of continuing to explore - see the mission-complete handling there.
+        self.exploration_complete_ = False
+        # Set once the robot has returned home after exploration_complete_ and no artefacts
+        # remain pending - main_loop stops doing anything further once this is true.
+        self.mission_complete_ = False
 
         # Planning 2/3: the artefact cluster currently being approached for close-range
         # inspection (a dict from artifact_clusters_), or None if not inspecting.
@@ -881,10 +888,12 @@ class CaveExplorer(Node):
             else:
                 self.no_frontier_streak_ += 1
                 if self.no_frontier_streak_ >= EXPLORATION_COMPLETE_STREAK:
-                    self.get_logger().info(
-                        f'EXPLORATION COMPLETE: no frontiers found for '
-                        f'{self.no_frontier_streak_} consecutive checks - the cave appears '
-                        'to be fully mapped')
+                    if not self.exploration_complete_:
+                        self.get_logger().info(
+                            f'EXPLORATION COMPLETE: no frontiers found for '
+                            f'{self.no_frontier_streak_} consecutive checks - the cave appears '
+                            'to be fully mapped')
+                    self.exploration_complete_ = True
                 else:
                     self.get_logger().info('No frontiers right now - taking a random step')
             self.planner_random_walk()
@@ -1186,7 +1195,12 @@ class CaveExplorer(Node):
         Set the next goal pose and send to the action server
         See https://docs.nav2.org/concepts/index.html
         """
-        
+
+        # Mission already wrapped up (cave fully explored, every known artefact visited or
+        # abandoned, robot back at base) - nothing further to do.
+        if self.mission_complete_:
+            return
+
         # Don't do anything until SLAM is launched
         if not self.tf_buffer.can_transform(
                 'map',
@@ -1248,6 +1262,17 @@ class CaveExplorer(Node):
                     self.inspection_target_ = None
                     self.inspection_attempts_ = 0
                 # else: inspection_target_ stays set, so it's retried below
+        elif self.planner_type_ == PlannerType.RETURN_HOME:
+            # The final "go home" goal just finished (either way) - mission over, don't fall
+            # through to picking another goal below
+            elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
+            outcome = 'reached base' if self.last_goal_succeeded_ else "didn't quite reach base"
+            self.get_logger().info(
+                f'[MISSION COMPLETE] {outcome} after {elapsed_s:.0f}s - '
+                f'{len(self.visited_artifact_ids_)} artefact(s) inspected, '
+                f'{len(self.abandoned_artifact_ids_)} abandoned')
+            self.mission_complete_ = True
+            return
 
         self.publish_visited_artifact_markers()
 
@@ -1257,6 +1282,9 @@ class CaveExplorer(Node):
 
         if self.inspection_target_ is not None:
             self.planner_type_ = PlannerType.INSPECT_ARTIFACT
+        elif self.exploration_complete_:
+            # Nothing left to explore and nothing left to inspect - head home and stop
+            self.planner_type_ = PlannerType.RETURN_HOME
         else:
             self.planner_type_ = PlannerType.EXPLORE_FRONTIER
 
