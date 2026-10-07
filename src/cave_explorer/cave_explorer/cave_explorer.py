@@ -637,6 +637,35 @@ class CaveExplorer(Node):
         y = self.map_origin_[1] + (row + 0.5) * self.map_resolution_
         return x, y
 
+    def world_to_grid(self, x, y):
+        """Planning 2: inverse of grid_to_world() - map-frame (x, y) to occupancy-grid (row, col)"""
+
+        col = int((x - self.map_origin_[0]) / self.map_resolution_)
+        row = int((y - self.map_origin_[1]) / self.map_resolution_)
+        return row, col
+
+    def is_point_navigable(self, x, y, clearance_cells=2):
+        """
+        Planning 2: check whether (x, y) is free space (not occupied, not unexplored) in the
+        current map, with a small clearance margin - used to validate a candidate inspection
+        standoff point before sending it to Nav2, since a point computed purely from the
+        artefact's position can otherwise land inside a wall or in unexplored space (which
+        Nav2's global planner then simply can't find a path to at all).
+        """
+
+        if self.map_grid_ is None:
+            return False
+
+        row, col = self.world_to_grid(x, y)
+        height, width = self.map_grid_.shape
+        row_lo, row_hi = max(0, row - clearance_cells), min(height, row + clearance_cells + 1)
+        col_lo, col_hi = max(0, col - clearance_cells), min(width, col + clearance_cells + 1)
+        if row_lo >= row_hi or col_lo >= col_hi:
+            return False
+
+        patch = self.map_grid_[row_lo:row_hi, col_lo:col_hi]
+        return bool(np.all((patch >= 0) & (patch < FRONTIER_OCCUPIED_THRESHOLD)))
+
     def find_frontier_cells(self):
         """
         Planning 1: return a boolean mask of 'frontier' cells - free cells that neighbour at
@@ -869,9 +898,15 @@ class CaveExplorer(Node):
 
     def planner_inspect_artifact(self):
         """
-        Planning 2: navigate to a close-range standoff viewpoint of self.inspection_target_,
-        approaching from the robot's current side (so the path there is short and obstacle-free)
-        and facing the artefact once there.
+        Planning 2/3: navigate to a close-range standoff viewpoint of self.inspection_target_.
+
+        Tries a handful of candidate approach angles around the artefact, starting with
+        approaching from the robot's current side (shortest path) and otherwise spaced around
+        it, using the first one that validates as free space in the current map (see
+        is_point_navigable()). A standoff point computed from the artefact's position alone can
+        otherwise land inside a wall or in unexplored space if the artefact happens to be close
+        to one - which Nav2's global planner then can't find a path to at all, rather than just
+        navigating there poorly.
         """
 
         robot_pose = self.get_pose_2d()
@@ -881,18 +916,27 @@ class CaveExplorer(Node):
         target = self.inspection_target_['position']
         dx = robot_pose.x - target.x
         dy = robot_pose.y - target.y
-        distance = math.hypot(dx, dy)
-        if distance < 1e-3:
-            # Degenerate case: robot is (almost) exactly on top of the artefact - pick an
-            # arbitrary approach direction rather than dividing by ~0 below
-            dx, dy, distance = 1.0, 0.0, 1.0
+        base_angle = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-3 else 0.0
 
-        # Standoff point: INSPECTION_STANDOFF_DISTANCE_M from the artefact, back along the
-        # line towards the robot's current position
-        goal_x = target.x + dx / distance * INSPECTION_STANDOFF_DISTANCE_M
-        goal_y = target.y + dy / distance * INSPECTION_STANDOFF_DISTANCE_M
+        candidate_offsets = [0.0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2,
+                             3 * math.pi / 4, -3 * math.pi / 4, math.pi]
+        goal_x = goal_y = None
+        for offset in candidate_offsets:
+            angle = base_angle + offset
+            candidate_x = target.x + math.cos(angle) * INSPECTION_STANDOFF_DISTANCE_M
+            candidate_y = target.y + math.sin(angle) * INSPECTION_STANDOFF_DISTANCE_M
+            if self.is_point_navigable(candidate_x, candidate_y):
+                goal_x, goal_y = candidate_x, candidate_y
+                break
+
+        if goal_x is None:
+            # Nothing validated (e.g. map not built yet, or the artefact is tightly enclosed) -
+            # fall back to the direct approach anyway; the goal watchdog (GOAL_TIMEOUT_S) will
+            # recover if Nav2 genuinely can't reach it
+            goal_x = target.x + math.cos(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
+            goal_y = target.y + math.sin(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
+
         theta = math.atan2(target.y - goal_y, target.x - goal_x)  # face the artefact
-
         self.planner_go_to_pose2d(Pose2D(x=goal_x, y=goal_y, theta=theta))
 
     def planner_go_to_pose2d(self, pose2d):
