@@ -283,7 +283,10 @@ STATUS_LOG_PERIOD_S = 30.0
 # "Failed to make progress") more or less indefinitely without ever reporting success or
 # failure back to us. If a goal hasn't finished within this many seconds, we give up on it
 # ourselves - see the watchdog at the top of main_loop() - rather than waiting forever.
-GOAL_TIMEOUT_S = 60.0
+# Lowered from 60s: observed stuck goals rarely resolved themselves after the first ~20-30s of
+# repeated "Failed to make progress" cycles anyway, so waiting the full 60s was mostly just
+# wasted time (visible as the robot appearing to "freeze") rather than giving it a real chance.
+GOAL_TIMEOUT_S = 30.0
 
 
 class CaveExplorer(Node):
@@ -752,13 +755,20 @@ class CaveExplorer(Node):
         row = int((y - self.map_origin_[1]) / self.map_resolution_)
         return row, col
 
-    def is_point_navigable(self, x, y, clearance_cells=2):
+    def is_point_navigable(self, x, y, clearance_cells=3):
         """
         Planning 2: check whether (x, y) is free space (not occupied, not unexplored) in the
         current map, with a small clearance margin - used to validate a candidate inspection
         standoff point before sending it to Nav2, since a point computed purely from the
         artefact's position can otherwise land inside a wall or in unexplored space (which
-        Nav2's global planner then simply can't find a path to at all).
+        Nav2's global planner then simply can't find a path to at all). Also used to validate
+        frontier/random-walk goals.
+
+        clearance_cells raised from 2 to 3: a point can be technically "free" right at the edge
+        of a wall and still be the kind of tight squeeze that makes the local controller
+        struggle to actually execute the approach (repeated "Failed to make progress"), even
+        though the global planner found it reachable in principle. A bit more buffer picks
+        goals with genuine room around them instead.
         """
 
         if self.map_grid_ is None:
