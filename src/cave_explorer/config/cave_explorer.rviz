@@ -578,6 +578,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /marker_array_artifacts
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: FrontierMarkers
+      Namespaces:
+        frontier_candidates: true
+        frontier_chosen: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /frontier_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
