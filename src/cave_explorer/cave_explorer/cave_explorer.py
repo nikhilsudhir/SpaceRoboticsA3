@@ -231,13 +231,17 @@ FRONTIER_MIN_CLUSTER_SIZE = 15
 # significantly discounting it - see choose_frontier_goal()'s score formula. Larger means
 # distance matters less relative to size, so a big far frontier can still beat a tiny close one.
 FRONTIER_DISTANCE_SCALE_M = 5.0
-# Candidate frontiers within this distance (metres) of a goal we've ever sent before are
-# skipped, so we don't repeatedly re-target the same spot (e.g. if Nav2 can't quite reach the
-# frontier itself, or a sensor-shadow sliver flickers in and out near a path we've already
-# driven). Unlike a short-lived "recent goals" window, recent_frontier_goals_ is never
-# truncated - every frontier goal from the whole run is remembered, so the robot can't forget
-# it was already here and go back after enough time/goals have passed.
+# Candidate frontiers within this distance (metres) of a goal sent in the last
+# FRONTIER_REVISIT_WINDOW_S seconds are skipped, so we don't repeatedly re-target the same
+# spot (e.g. if Nav2 can't quite reach the frontier itself, or a sensor-shadow sliver flickers
+# in and out near a path we've already driven).
 FRONTIER_REVISIT_RADIUS_M = 4.0
+# How long (seconds) a sent goal keeps excluding nearby frontiers for. Needs to be a *window*,
+# not permanent: on a long run, dozens of permanently-excluded 4m zones in a corridor-width
+# cave can start blanketing genuinely new nearby frontiers too, forcing the robot to fall back
+# to a random (possibly far away) point instead of the closest real unexplored bit - observed
+# as excessive backtracking across the whole map on long runs.
+FRONTIER_REVISIT_WINDOW_S = 180.0
 
 # Planning 1: after this many consecutive checks with a real map available but no frontier
 # candidates found, treat exploration as complete (rather than a one-off gap) and say so
@@ -305,8 +309,8 @@ class CaveExplorer(Node):
         # Variables/Flags for planning
         self.planner_type_ = PlannerType.ERROR
 
-        # Planning 1: world-frame (x, y) of every frontier goal ever sent this run, so we never
-        # re-target the same spot - see FRONTIER_REVISIT_RADIUS_M's comment above.
+        # Planning 1: (x, y, time_sent) of frontier goals sent within the last
+        # FRONTIER_REVISIT_WINDOW_S - see that constant's comment above.
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
         # Planning 1: consecutive ticks with a real map but no frontier candidates - see
@@ -896,6 +900,13 @@ class CaveExplorer(Node):
         path_distance_grid = self.compute_path_distance_grid(robot_row, robot_col)
         height, width = path_distance_grid.shape
 
+        # Drop goals older than the revisit window - see FRONTIER_REVISIT_WINDOW_S's comment
+        now = self.get_clock().now()
+        self.recent_frontier_goals_ = [
+            (gx, gy, gt) for gx, gy, gt in self.recent_frontier_goals_
+            if (now - gt).nanoseconds / 1e9 < FRONTIER_REVISIT_WINDOW_S
+        ]
+
         candidates = []
         for cluster in clusters:
             if len(cluster) < FRONTIER_MIN_CLUSTER_SIZE:
@@ -906,7 +917,7 @@ class CaveExplorer(Node):
             world_x, world_y = self.grid_to_world(mean_row, mean_col)
 
             if any(math.hypot(world_x - gx, world_y - gy) < FRONTIER_REVISIT_RADIUS_M
-                   for gx, gy in self.recent_frontier_goals_):
+                   for gx, gy, _ in self.recent_frontier_goals_):
                 continue
 
             row_idx = min(max(int(round(mean_row)), 0), height - 1)
@@ -1007,8 +1018,8 @@ class CaveExplorer(Node):
         theta = math.atan2(goal_y - robot_pose.y, goal_x - robot_pose.x)
         goal_pose2d = Pose2D(x=goal_x, y=goal_y, theta=theta)
 
-        # Never evicted - see FRONTIER_REVISIT_RADIUS_M's comment for why
-        self.recent_frontier_goals_.append((goal_x, goal_y))
+        # Expires after FRONTIER_REVISIT_WINDOW_S - see that constant's comment for why
+        self.recent_frontier_goals_.append((goal_x, goal_y, self.get_clock().now()))
 
         self.planner_go_to_pose2d(goal_pose2d)
 
@@ -1231,29 +1242,45 @@ class CaveExplorer(Node):
 
     def planner_random_walk(self):
         """
-        Go to a random, navigable location within the current map bounds.
+        Go to the nearest-to-the-robot navigable location out of several random samples
+        within the current map bounds.
 
         Sampling uniformly within xlim_/ylim_ can easily land inside a wall or unexplored
         space for an irregular cave shape (most of the bounding box isn't actual floor) -
         that previously sent Nav2 on goals it could never reach at all, costing a full 60s
-        goal-timeout each time. Each candidate is now checked with is_point_navigable()
-        before being sent.
+        goal-timeout each time. Each candidate is checked with is_point_navigable() before
+        being considered. Of the candidates that do validate, the nearest one is chosen
+        (rather than just the first found) - otherwise this fallback has no locality
+        preference at all, and can send the robot clear across the whole cave instead of to
+        the closest unclaimed spot, forcing a long traversal back through already-explored
+        corridors (observed as excessive backtracking on long runs).
         """
 
+        robot_pose = self.get_pose_2d()
+
+        candidates = []
         for _ in range(RANDOM_WALK_MAX_ATTEMPTS):
             x = random.uniform(self.xlim_[0], self.xlim_[1])
             y = random.uniform(self.ylim_[0], self.ylim_[1])
             if self.is_point_navigable(x, y):
-                goal_pose2d = Pose2D(x=x, y=y, theta=random.uniform(0, 2 * math.pi))
-                self.planner_go_to_pose2d(goal_pose2d)
-                return
+                candidates.append((x, y))
 
-        # No navigable point found (e.g. map not built yet) - hold position rather than risk
-        # another long Nav2 failure/recovery cycle on an unreachable random point
-        self.get_logger().warn('No navigable random point found - holding position')
-        robot_pose = self.get_pose_2d()
+        if not candidates:
+            # No navigable point found (e.g. map not built yet) - hold position rather than
+            # risk another long Nav2 failure/recovery cycle on an unreachable random point
+            self.get_logger().warn('No navigable random point found - holding position')
+            if robot_pose is not None:
+                self.planner_go_to_pose2d(robot_pose)
+            return
+
         if robot_pose is not None:
-            self.planner_go_to_pose2d(robot_pose)
+            x, y = min(candidates,
+                       key=lambda c: math.hypot(c[0] - robot_pose.x, c[1] - robot_pose.y))
+        else:
+            x, y = random.choice(candidates)
+
+        goal_pose2d = Pose2D(x=x, y=y, theta=random.uniform(0, 2 * math.pi))
+        self.planner_go_to_pose2d(goal_pose2d)
 
     def planner_random_goal(self):
         """Go to a random location out of a predefined set"""
