@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import functools
 import math
 import os
 import random
@@ -188,6 +189,12 @@ INSPECTION_STANDOFF_DISTANCE_M = 2.0
 # abandoning that artefact and resuming exploration.
 INSPECTION_MAX_RETRIES = 1
 
+# Planning 1/3 robustness: Nav2's own recovery behaviour tree can retry a difficult goal (e.g.
+# "Failed to make progress") more or less indefinitely without ever reporting success or
+# failure back to us. If a goal hasn't finished within this many seconds, we give up on it
+# ourselves - see the watchdog at the top of main_loop() - rather than waiting forever.
+GOAL_TIMEOUT_S = 60.0
+
 
 class CaveExplorer(Node):
     def __init__(self):
@@ -257,6 +264,13 @@ class CaveExplorer(Node):
         self.get_logger().warn('navigate_to_pose connected')
         self.ready_for_next_goal_ = True
         self.declare_parameter('print_feedback', rclpy.Parameter.Type.BOOL)
+
+        # Robustness: tracks the most recently sent goal, so main_loop's watchdog (see
+        # GOAL_TIMEOUT_S) can give up on one that's taking too long, and so a late callback
+        # for an already-abandoned goal can be recognised as stale and ignored rather than
+        # corrupting the state of whatever goal we've since moved on to.
+        self.goal_generation_ = 0
+        self.goal_sent_time_ = None
 
         # Publisher for the goal pose visualisation
         self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
@@ -899,15 +913,26 @@ class CaveExplorer(Node):
         else:
             feedback_method = None
 
-        # Send goal to action server
+        # Send goal to action server. Tag this goal with a generation number, and have the
+        # callbacks below check it against self.goal_generation_ before acting - if the
+        # watchdog in main_loop() has since given up on this goal and moved on, these would
+        # otherwise be a late, stale response overwriting the state of the *next* goal.
+        self.goal_generation_ += 1
+        generation = self.goal_generation_
+        self.goal_sent_time_ = self.get_clock().now()
+
         self.get_logger().warn(f'Sending goal [{pose2d.x:.2f}, {pose2d.y:.2f}]...')
         self.send_goal_future_ = self.nav2_action_client_.send_goal_async(
             action_goal,
             feedback_callback=feedback_method)
-        self.send_goal_future_.add_done_callback(self.goal_response_callback)
+        self.send_goal_future_.add_done_callback(
+            functools.partial(self.goal_response_callback, generation=generation))
 
-    def goal_response_callback(self, future):
+    def goal_response_callback(self, future, generation):
         """The requested goal pose has been sent to the action server"""
+
+        if generation != self.goal_generation_:
+            return  # stale: we've since given up on this goal (see GOAL_TIMEOUT_S) and moved on
 
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -919,7 +944,8 @@ class CaveExplorer(Node):
         # Goal accepted: get result when it's completed
         self.get_logger().warn(f'Goal accepted')
         self.get_result_future_ = goal_handle.get_result_async()
-        self.get_result_future_.add_done_callback(self.goal_reached_callback)
+        self.get_result_future_.add_done_callback(
+            functools.partial(self.goal_reached_callback, generation=generation))
 
     def feedback_callback(self, feedback_msg):
         """Monitor the feedback from the action server"""
@@ -928,8 +954,11 @@ class CaveExplorer(Node):
 
         self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
 
-    def goal_reached_callback(self, future):
+    def goal_reached_callback(self, future, generation):
         """The requested goal has finished (successfully or not)"""
+
+        if generation != self.goal_generation_:
+            return  # stale: we've since given up on this goal (see GOAL_TIMEOUT_S) and moved on
 
         status = future.result().status
         self.last_goal_succeeded_ = (status == GoalStatus.STATUS_SUCCEEDED)
@@ -1035,6 +1064,20 @@ class CaveExplorer(Node):
 
         #######################################################
         # Update flags related to the progress of the current planner
+
+        # Robustness watchdog: Nav2's own recovery behaviour tree can retry a difficult goal
+        # (e.g. repeated "Failed to make progress") for a very long time without ever reporting
+        # back. If the current goal has been outstanding too long, give up on it ourselves
+        # rather than waiting forever - the next goal we send will naturally preempt whatever
+        # Nav2 is still doing with this one.
+        if not self.ready_for_next_goal_ and self.goal_sent_time_ is not None:
+            elapsed_s = (self.get_clock().now() - self.goal_sent_time_).nanoseconds / 1e9
+            if elapsed_s > GOAL_TIMEOUT_S:
+                self.get_logger().warn(
+                    f'Goal timed out after {elapsed_s:.0f}s with no result - abandoning it')
+                self.last_goal_succeeded_ = False
+                self.ready_for_next_goal_ = True
+                self.goal_sent_time_ = None
 
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
