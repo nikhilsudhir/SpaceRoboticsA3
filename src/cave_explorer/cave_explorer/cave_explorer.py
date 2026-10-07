@@ -51,6 +51,60 @@ def pose2d_to_pose(pose_2d):
     return pose
 
 
+# Perception 2: distance (pixels) within which two bounding boxes are merged into one - see
+# merge_overlapping_boxes().
+BOX_MERGE_GAP_PX = 10
+
+
+def merge_overlapping_boxes(boxes, gap_px=BOX_MERGE_GAP_PX):
+    """
+    Perception 2: merge bounding boxes that are at or within 'gap_px' of each other (including
+    touching/overlapping) into a single box per group, using union-find.
+
+    A single real artefact's colour mask can fragment into several disconnected contours
+    (shading, texture, specular highlights on the 3D model), which would otherwise each become
+    a separate detection for what's visually one object. Genuinely separate instances of the
+    same artefact type elsewhere in the frame (far apart) are left as distinct boxes.
+    """
+
+    if len(boxes) <= 1:
+        return list(boxes)
+
+    def expand(box):
+        x, y, w, h = box
+        return (x - gap_px, y - gap_px, x + w + gap_px, y + h + gap_px)
+
+    def overlaps(a, b):
+        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+    expanded = [expand(box) for box in boxes]
+    parent = list(range(len(boxes)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if overlaps(expanded[i], expanded[j]):
+                parent[find(i)] = find(j)
+
+    groups = {}
+    for i in range(len(boxes)):
+        groups.setdefault(find(i), []).append(i)
+
+    merged = []
+    for indices in groups.values():
+        x1 = min(boxes[i][0] for i in indices)
+        y1 = min(boxes[i][1] for i in indices)
+        x2 = max(boxes[i][0] + boxes[i][2] for i in indices)
+        y2 = max(boxes[i][1] + boxes[i][3] for i in indices)
+        merged.append((x1, y1, x2 - x1, y2 - y1))
+    return merged
+
+
 class PlannerType(Enum):
     ERROR = 0
     MOVE_FORWARDS = 1
@@ -489,11 +543,13 @@ class CaveExplorer(Node):
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for contour in contours:
-                if cv2.contourArea(contour) < profile['min_area']:
-                    continue
+            boxes = [cv2.boundingRect(contour) for contour in contours
+                     if cv2.contourArea(contour) >= profile['min_area']]
 
-                bbox = cv2.boundingRect(contour)
+            # A single real artefact can still produce several disconnected contours (shading,
+            # texture, specular highlights), which would otherwise show up as several separate
+            # detections for what's visually one object - merge any that are close together.
+            for bbox in merge_overlapping_boxes(boxes):
                 detections.append(Detection(profile['label'], bbox, profile['color_rgb']))
 
         return detections
