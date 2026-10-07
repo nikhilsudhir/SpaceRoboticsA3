@@ -214,6 +214,10 @@ INSPECTION_MAX_RETRIES = 1
 # to absorb that drift, while still being tighter than the spacing between distinct artefacts.
 INSPECTION_DUPLICATE_RADIUS_M = 3.0
 
+# Planning 1 robustness: how many random points planner_random_walk() tries before giving up
+# and holding position, when looking for one that's actually navigable (see is_point_navigable()).
+RANDOM_WALK_MAX_ATTEMPTS = 30
+
 # Planning 1/3 robustness: Nav2's own recovery behaviour tree can retry a difficult goal (e.g.
 # "Failed to make progress") more or less indefinitely without ever reporting success or
 # failure back to us. If a goal hasn't finished within this many seconds, we give up on it
@@ -1107,15 +1111,30 @@ class CaveExplorer(Node):
         self.planner_go_to_pose2d(goal_pose2d)
 
     def planner_random_walk(self):
-        """Go to a random location, which may be invalid"""
+        """
+        Go to a random, navigable location within the current map bounds.
 
-        # Select a random location
-        goal_pose2d = Pose2D(
-            x = random.uniform(self.xlim_[0], self.xlim_[1]),
-            y = random.uniform(self.ylim_[0], self.ylim_[1]),
-            theta = random.uniform(0, 2*math.pi)
-        )
-        self.planner_go_to_pose2d(goal_pose2d)
+        Sampling uniformly within xlim_/ylim_ can easily land inside a wall or unexplored
+        space for an irregular cave shape (most of the bounding box isn't actual floor) -
+        that previously sent Nav2 on goals it could never reach at all, costing a full 60s
+        goal-timeout each time. Each candidate is now checked with is_point_navigable()
+        before being sent.
+        """
+
+        for _ in range(RANDOM_WALK_MAX_ATTEMPTS):
+            x = random.uniform(self.xlim_[0], self.xlim_[1])
+            y = random.uniform(self.ylim_[0], self.ylim_[1])
+            if self.is_point_navigable(x, y):
+                goal_pose2d = Pose2D(x=x, y=y, theta=random.uniform(0, 2 * math.pi))
+                self.planner_go_to_pose2d(goal_pose2d)
+                return
+
+        # No navigable point found (e.g. map not built yet) - hold position rather than risk
+        # another long Nav2 failure/recovery cycle on an unreachable random point
+        self.get_logger().warn('No navigable random point found - holding position')
+        robot_pose = self.get_pose_2d()
+        if robot_pose is not None:
+            self.planner_go_to_pose2d(robot_pose)
 
     def planner_random_goal(self):
         """Go to a random location out of a predefined set"""
