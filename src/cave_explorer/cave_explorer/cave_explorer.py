@@ -283,10 +283,13 @@ STATUS_LOG_PERIOD_S = 30.0
 # "Failed to make progress") more or less indefinitely without ever reporting success or
 # failure back to us. If a goal hasn't finished within this many seconds, we give up on it
 # ourselves - see the watchdog at the top of main_loop() - rather than waiting forever.
-# Lowered from 60s: observed stuck goals rarely resolved themselves after the first ~20-30s of
-# repeated "Failed to make progress" cycles anyway, so waiting the full 60s was mostly just
-# wasted time (visible as the robot appearing to "freeze") rather than giving it a real chance.
-GOAL_TIMEOUT_S = 30.0
+# Lowered from 60s (stuck goals rarely resolved themselves after the first ~20-30s anyway, so
+# waiting the full 60s was mostly wasted "frozen" time) but kept at 3x the controller's
+# progress_checker movement_time_allowance (15s in nav2_params.yaml), not a flat 30s: those two
+# values interact - if the timeout is too short relative to the check interval, Nav2's own
+# recovery behaviours (spin/backup/wait) don't get enough cycles to actually resolve a
+# difficult-but-recoverable spot before we give up on it ourselves.
+GOAL_TIMEOUT_S = 45.0
 
 
 class CaveExplorer(Node):
