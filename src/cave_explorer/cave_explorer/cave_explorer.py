@@ -175,6 +175,11 @@ FRONTIER_REVISIT_RADIUS_M = 3.0
 # How many recent frontier goals to remember for the revisitation check above.
 FRONTIER_REVISIT_HISTORY = 15
 
+# Planning 1: after this many consecutive checks with a real map available but no frontier
+# candidates found, treat exploration as complete (rather than a one-off gap) and say so
+# clearly in the logs - distinct from the same "no candidates" result before the map exists.
+EXPLORATION_COMPLETE_STREAK = 5
+
 # Planning 2: artefact types the robot will pause exploration to inspect up close. Chosen as
 # the 3 most visually distinct profiles in ARTIFACT_COLOR_PROFILES (per that list's own
 # comments, e.g. green_alien/toy_story_alien and white_sphere/ice_formation are more likely
@@ -233,6 +238,9 @@ class CaveExplorer(Node):
         # immediately re-targeting the same spot (e.g. if Nav2 can't quite reach a frontier).
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
+        # Planning 1: consecutive ticks with a real map but no frontier candidates - see
+        # EXPLORATION_COMPLETE_STREAK and planner_explore_frontier().
+        self.no_frontier_streak_ = 0
 
         # Planning 2/3: the artefact cluster currently being approached for close-range
         # inspection (a dict from artifact_clusters_), or None if not inspecting.
@@ -842,10 +850,21 @@ class CaveExplorer(Node):
             # planner_random_walk() samples directly from the current map bounds, so (unlike
             # planner_random_goal()'s fixed coordinate list) it always finds a valid point even
             # very early on (e.g. before the first map message arrives) or on an unfamiliar map
-            self.get_logger().info('No frontiers to explore right now - taking a random step')
+            if self.map_grid_ is None:
+                self.get_logger().info('No map yet - taking a random step until SLAM has data')
+            else:
+                self.no_frontier_streak_ += 1
+                if self.no_frontier_streak_ >= EXPLORATION_COMPLETE_STREAK:
+                    self.get_logger().info(
+                        f'EXPLORATION COMPLETE: no frontiers found for '
+                        f'{self.no_frontier_streak_} consecutive checks - the cave appears '
+                        'to be fully mapped')
+                else:
+                    self.get_logger().info('No frontiers right now - taking a random step')
             self.planner_random_walk()
             return
 
+        self.no_frontier_streak_ = 0
         goal_x, goal_y = chosen['position']
         theta = math.atan2(goal_y - robot_pose.y, goal_x - robot_pose.x)
         goal_pose2d = Pose2D(x=goal_x, y=goal_y, theta=theta)
