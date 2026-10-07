@@ -143,20 +143,23 @@ controller_server:
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 2.0 #1.0
+      # Lowered from 2.0/5.0 (accel) - that combination was fast and aggressive enough to
+      # overshoot/clip walls on the cave's sharp turns even with a correct footprint, since
+      # at 5Hz control frequency the robot covers real distance between corrections.
+      max_vel_x: 0.8 #2.0 #1.0
       max_vel_y: 0.0
-      max_vel_theta: 1.5
+      max_vel_theta: 1.2 #1.5
       min_speed_xy: 0.0
-      max_speed_xy: 2.0 #1.0
+      max_speed_xy: 0.8 #2.0 #1.0
       min_speed_theta: 0.0
       # Add high threshold velocity for turtlebot 3 issue.
       # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
-      acc_lim_x: 5.0 # 2.5
+      acc_lim_x: 2.0 #5.0 # 2.5
       acc_lim_y: 0.0
-      acc_lim_theta: 3.2
-      decel_lim_x: -5.0 # -2.5
+      acc_lim_theta: 2.0 #3.2
+      decel_lim_x: -2.0 #-5.0 # -2.5
       decel_lim_y: 0.0
-      decel_lim_theta: -3.2
+      decel_lim_theta: -2.0 #-3.2
       vx_samples: 20 #7
       vy_samples: 1 #5 #1
       vtheta_samples: 7 #20 #7
@@ -195,8 +198,12 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.3 # 0.05
-      robot_radius: 0.5 #added by GB 
-      # footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
+      # Was robot_radius: 0.5 (a circle), but base_link's actual collision geometry is a 1x1m
+      # box (see mars_explorer.urdf.xacro) - a 0.5m-radius circle underestimates the footprint
+      # at the corners (a 1x1m box's corners are ~0.71m from centre), which let the planner
+      # approve paths that looked clear but clipped walls when the robot turned. Using the
+      # exact square footprint instead of an approximated circle fixes this precisely.
+      footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -230,8 +237,8 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: True
       transform_tolerance: 1.0
-      robot_radius: 0.5 #added by GB 
-      # footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
+      # See local_costmap's footprint comment above - same fix applied here
+      footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
       width: 100 # 10
       height: 100 # 10
       rolling_window: true
@@ -343,10 +350,11 @@ velocity_smoother:
     smoothing_frequency: 5.0 # 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [2.0, 0.0, 1.5]
-    min_velocity: [-2.0, 0.0, -1.5]
-    max_accel: [5.0, 0.0, 3.2]
-    max_decel: [-5.0, 0.0, -3.2]
+    # Kept in sync with FollowPath/DWB's max_vel_x/max_vel_theta/acc_lim_x/acc_lim_theta above
+    max_velocity: [0.8, 0.0, 1.2]
+    min_velocity: [-0.8, 0.0, -1.2]
+    max_accel: [2.0, 0.0, 2.0]
+    max_decel: [-2.0, 0.0, -2.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

@@ -777,17 +777,54 @@ class CaveExplorer(Node):
 
         return clusters
 
+    def compute_path_distance_grid(self, start_row, start_col):
+        """
+        Planning 1: BFS over free cells from (start_row, start_col), returning a same-shaped
+        array of path distance in cells (-1 where unreachable through known free space).
+
+        Used so frontier scoring reflects actual path distance through the cave's corridors,
+        rather than straight-line distance - which can be badly misleading in a branching
+        maze (a frontier might look close as the crow flies but actually require a long
+        detour through the only real corridor, or vice versa).
+        """
+
+        grid = self.map_grid_
+        height, width = grid.shape
+        free = (grid >= 0) & (grid < FRONTIER_OCCUPIED_THRESHOLD)
+
+        dist = np.full((height, width), -1, dtype=np.int32)
+        if not free[start_row, start_col]:
+            return dist
+
+        dist[start_row, start_col] = 0
+        queue = deque([(start_row, start_col)])
+        while queue:
+            r, c = queue.popleft()
+            d = dist[r, c]
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < height and 0 <= nc < width \
+                            and free[nr, nc] and dist[nr, nc] == -1:
+                        dist[nr, nc] = d + 1
+                        queue.append((nr, nc))
+
+        return dist
+
     def choose_frontier_goal(self, robot_pose):
         """
         Planning 1: pick the best frontier cluster to explore next.
 
-        Score = cluster size / (1 + distance / FRONTIER_DISTANCE_SCALE_M): prefers larger
-        frontiers (more new area to reveal), with distance as a secondary tiebreaker rather
-        than a dominant factor - so a big far frontier can still beat a tiny close one, which
-        matters because small clusters near already-explored corridors are usually just
-        sensor-shadow slivers, not real new territory. Clusters smaller than
-        FRONTIER_MIN_CLUSTER_SIZE are dropped as likely noise, and clusters near any
-        previously-sent goal are skipped (revisitation avoidance).
+        Score = cluster size / (1 + path_distance / FRONTIER_DISTANCE_SCALE_M): prefers larger
+        frontiers (more new area to reveal), with path distance (through the known free-space
+        corridors - see compute_path_distance_grid()) as a secondary tiebreaker rather than a
+        dominant factor - so a big far frontier can still beat a tiny close one, which matters
+        because small clusters near already-explored corridors are usually just sensor-shadow
+        slivers, not real new territory. Clusters smaller than FRONTIER_MIN_CLUSTER_SIZE are
+        dropped as likely noise, and clusters near any previously-sent goal are skipped
+        (revisitation avoidance).
 
         Returns (chosen, candidates): 'chosen' is the best candidate dict (or None if none are
         valid), 'candidates' is every candidate considered (for visualisation).
@@ -798,6 +835,10 @@ class CaveExplorer(Node):
 
         frontier_mask = self.find_frontier_cells()
         clusters = self.cluster_frontier_cells(frontier_mask)
+
+        robot_row, robot_col = self.world_to_grid(robot_pose.x, robot_pose.y)
+        path_distance_grid = self.compute_path_distance_grid(robot_row, robot_col)
+        height, width = path_distance_grid.shape
 
         candidates = []
         for cluster in clusters:
@@ -812,7 +853,13 @@ class CaveExplorer(Node):
                    for gx, gy in self.recent_frontier_goals_):
                 continue
 
-            distance = math.hypot(world_x - robot_pose.x, world_y - robot_pose.y)
+            row_idx = min(max(int(round(mean_row)), 0), height - 1)
+            col_idx = min(max(int(round(mean_col)), 0), width - 1)
+            path_cells = path_distance_grid[row_idx, col_idx]
+            # Not reachable through known free space at all (e.g. an isolated noise pocket) -
+            # still include it (for visualisation) but make sure it never scores highest
+            distance = path_cells * self.map_resolution_ if path_cells >= 0 else float('inf')
+
             score = len(cluster) / (1.0 + distance / FRONTIER_DISTANCE_SCALE_M)
             candidates.append({
                 'position': (world_x, world_y),
