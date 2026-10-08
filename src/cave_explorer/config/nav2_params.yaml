@@ -243,9 +243,19 @@ global_costmap:
       transform_tolerance: 1.0
       # See local_costmap's footprint comment above - same fix applied here
       footprint: "[ [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5] ]"
-      width: 100 # 10
-      height: 100 # 10
-      rolling_window: true
+      # rolling_window was true here, which is wrong for a GLOBAL costmap - it meant the
+      # global planner could only ever see a width x height window centred on the robot's
+      # current position (30m x 30m at this resolution), not the whole explored map. Any
+      # frontier goal further than ~half that window away would fail with "off the global
+      # costmap" and send Nav2 into an unrecoverable spin/wait/clear-costmap retry loop, since
+      # no recovery behaviour can fix a goal that's genuinely outside the window. A rolling
+      # window belongs on the LOCAL costmap (for close-range obstacle avoidance, correctly set
+      # below); the global costmap should cover the full static map, which the static_layer
+      # plugin already resizes to automatically (see the "StaticLayer: Resizing..." log lines)
+      # once this is false.
+      rolling_window: false
+      width: 100 # initial size only now - static_layer resizes this to match the real map
+      height: 100
       resolution: 0.3 # 0.1
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]

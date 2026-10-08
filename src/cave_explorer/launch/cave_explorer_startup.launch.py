@@ -151,6 +151,8 @@ def generate_launch_description():
     # )
 
     # rviz2 visualises data
+    # --log-level warn silences rviz2's own routine chatter (e.g. "Trying to create a map of
+    # size...", repeated every time the map grows) while still showing real problems.
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -158,7 +160,8 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
         arguments=['-d', os.path.join(
             config_path,
-            'cave_explorer.rviz')]
+            'cave_explorer.rviz'),
+            '--ros-args', '--log-level', 'warn']
     )
 
     for action in force_software_rendering:

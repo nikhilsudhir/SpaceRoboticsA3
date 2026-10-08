@@ -33,11 +33,16 @@ def generate_launch_description():
     )
     
     # Start Navigation Stack
+    # log_level 'warn' silences Nav2's own routine per-tick chatter (e.g. "Passing new path
+    # to controller", "StaticLayer: Resizing costmap...", which otherwise drown out the
+    # cave_explorer node's own planning log lines) while still showing real problems -
+    # recoveries, aborts, timeouts - which are all WARN/ERROR level.
     navigation = IncludeLaunchDescription(
         PathJoinSubstitution([FindPackageShare('nav2_bringup'), 'launch', 'navigation_launch.py']),
         launch_arguments={
             'use_sim_time': use_sim_time,
-            'params_file': PathJoinSubstitution(config_path+['nav2_params.yaml'])
+            'params_file': PathJoinSubstitution(config_path+['nav2_params.yaml']),
+            'log_level': 'warn',
         }.items()
     )
 
