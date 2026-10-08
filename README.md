@@ -42,6 +42,12 @@ sudo apt install ros-humble-xacro
 
 `cave_explorer.py` also uses OpenCV via `cv_bridge` for computer vision, which is included in a standard ROS2 desktop install.
 
+The [Mission Control GUI](#mission-control-gui) needs PyQt5:
+
+```bash
+sudo apt install python3-pyqt5
+```
+
 ## Building
 
 You'll need a colcon workspace to build into — if you don't already have one from previous coursework, create one:
@@ -130,12 +136,43 @@ Drive the robot around (random walk/goals, waypoints, or teleop — see Percepti
 
 ### Autonomous exploration and artefact inspection (Planning 1–3)
 
-Once all three launch files are running, the robot explores and inspects artefacts fully autonomously — no manual goals needed. In RViz:
+Once all three launch files are running, the robot is ready to explore and inspect artefacts fully autonomously — no manual goals needed — but it waits for an explicit start trigger rather than beginning the instant the autonomy node launches. Start it either from the [GUI](#mission-control-gui) ("Start Exploring" button) or directly:
+
+```bash
+ros2 service call /start_mission std_srvs/srv/Trigger {}
+```
+
+In RViz:
 
 - **`frontier_markers`** (Planning 1) — yellow points are candidate exploration frontiers (free cells bordering unknown space, clustered), the red sphere is the one currently chosen. The robot heads there, then re-evaluates once it arrives (or the goal fails).
 - **`artifact_inspection_status_markers`** (Planning 3) — a small flag above each inspectable artefact: **red** = not yet inspected, **green** = successfully inspected, **orange** = abandoned after repeated failed approach attempts.
 
 Only `blue_cube`, `white_sphere`, and `green_crystals` (`INSPECTION_ARTIFACT_LABELS` in `cave_explorer.py`) trigger close-range inspection — these were judged the most visually distinct of Perception 2's colour profiles. When one is detected, the robot pauses exploring, navigates to a standoff viewpoint (`INSPECTION_STANDOFF_DISTANCE_M`, default 2 m) facing it, then resumes exploring. A failed approach is retried once (`INSPECTION_MAX_RETRIES`) before being abandoned.
+
+### Mission Control GUI
+
+A standalone PyQt5 dashboard (`cave_explorer/gui.py`), separate from RViz, for monitoring a run and starting it:
+
+```bash
+ros2 run cave_explorer gui
+```
+
+Run it alongside the three launch files (its own terminal, after `cave_explorer_autonomy.launch.py`). It shows:
+
+- **Mission status** — current mode, elapsed time, artefact counts, and average speed.
+- **Map** — the real occupancy grid (same data as RViz's Map display, subscribed to directly - not routed through the status feed), with the robot's current position, the active goal, and every confirmed artefact overlaid as a coloured pin.
+- **Artefact inventory** — every confirmed artefact (`ARTIFACT_CONFIRMATION_OBSERVATIONS`+ sightings), with its label, position, and status (colour-coded the same as the RViz inspection-status markers: green = visited, orange = abandoned, red = pending, grey = detected-but-not-inspectable).
+- **Event timeline** — a scrolling log of discoveries, inspections, abandons, and the final mission summary.
+
+Controls:
+
+- **Start Exploring** — calls the `start_mission` service (see above).
+- **Pause / Resume** — stops the robot in place and halts further decision-making (`pause_mission`/`resume_mission` services); re-click to resume. Note: pausing mid-`RETURN_HOME` deliberately lets that final leg finish rather than cancelling it, to avoid a cancelled-return being mistaken for a genuine failure on resume.
+- **Force Return Home** — skips remaining exploration and heads home immediately (`force_return_home` service), finishing any artefact already confirmed as a target first rather than abandoning it mid-approach.
+- **Export Summary** — writes the current status + full artefact inventory to a text file you choose, for pasting into the project report.
+- **Manual Override** (D-pad) — drive the robot directly via `/cmd_vel`. Only ever enabled while the mission is paused, not yet started, or already complete - **never** while `main_loop()` is actively driving, since autonomous and manual `cmd_vel` commands fighting each other would cause erratic motion. The buttons are disabled automatically outside those states, and switching back out of them forces an immediate zero-velocity stop.
+
+All of this is driven by one JSON-encoded topic, `gui_status`, published once a second by `cave_explorer_node` (see `publish_gui_status()`) - a custom message type wasn't worth the `.msg` package/rebuild for what's purely a GUI convenience. Any other tool (or a second GUI instance) can read the same topic.
 
 ## Development notes
 
