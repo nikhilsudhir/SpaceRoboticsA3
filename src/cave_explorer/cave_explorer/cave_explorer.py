@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import functools
+import json
 import math
 import os
 import random
@@ -19,6 +20,7 @@ from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -38,6 +40,33 @@ def wrap_angle(angle):
 
     return angle
 
+def dilate8_mask(mask):
+    """
+    Grow a boolean grid mask by one cell in all 8 directions (OR together the mask shifted by
+    each neighbour offset), without a slow per-cell python loop. Shared by find_frontier_cells()
+    and compute_path_distance_grid() - see each for how the result is used.
+    """
+
+    out = np.zeros_like(mask)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            shifted = np.roll(np.roll(mask, dr, axis=0), dc, axis=1)
+            # np.roll wraps around; clear the wrapped-in edge so it isn't mistaken for a
+            # real neighbour on the opposite side of the map
+            if dr == -1:
+                shifted[-1, :] = False
+            elif dr == 1:
+                shifted[0, :] = False
+            if dc == -1:
+                shifted[:, -1] = False
+            elif dc == 1:
+                shifted[:, 0] = False
+            out |= shifted
+    return out
+
+
 def pose2d_to_pose(pose_2d):
     """Convert a Pose2D to a full 3D Pose"""
     pose = Pose()
@@ -52,8 +81,15 @@ def pose2d_to_pose(pose_2d):
 
 
 # Perception 2: distance (pixels) within which two bounding boxes are merged into one - see
-# merge_overlapping_boxes().
-BOX_MERGE_GAP_PX = 10
+# merge_overlapping_boxes(). Raised from 10: a single object's silhouette can have a genuine
+# visible gap between two parts from some camera angles (e.g. a jagged/spiky crystal model),
+# wider than 10px was accounting for - live testing showed the same correctly-identified
+# label (e.g. green_alien) still split into two separate boxes for one physical object.
+# 30px is still small relative to a real detection's own size (min_area, the smallest
+# profiles allow, is already ~300px^2 - roughly a 17x17px box - so this won't casually bridge
+# two genuinely distinct nearby objects, since real artefacts in this world are spaced several
+# metres apart; it specifically targets gaps within one object's own silhouette.
+BOX_MERGE_GAP_PX = 30
 
 
 def merge_overlapping_boxes(boxes, gap_px=BOX_MERGE_GAP_PX):
@@ -105,6 +141,119 @@ def merge_overlapping_boxes(boxes, gap_px=BOX_MERGE_GAP_PX):
     return merged
 
 
+# Perception 2 robustness: two different-label detections are only treated as "the same
+# physical object seen twice" (see suppress_overlapping_labels()) if their bounding boxes
+# overlap by at least this much IoU (intersection over union). Plain "do they touch at all"
+# is not enough: a broad, low-confidence profile (e.g. mossy_boulder/toy_story_alien matching
+# wall or floor texture - a known false-positive source, since neither is actually placed in
+# this cave world) can produce a box spanning most of the frame, which would otherwise
+# "overlap" and wrongly swallow every other small, genuine detection in the same frame just
+# by bounding-box containment. IoU penalises that - a tiny real detection inside a huge
+# background box has very low IoU - while still catching the actual target case (two
+# deliberately-similar profiles both matching one object, producing near-identical boxes).
+LABEL_OVERLAP_IOU_THRESHOLD = 0.3
+
+# Perception 2 robustness: two different-label detections are ALSO treated as "the same
+# physical object/mount, detected via two different coloured parts of it" if their boxes are
+# within this many pixels of each other - even without the IoU overlap above. One mount can
+# show two genuinely different-coloured regions close together but not actually overlapping
+# (e.g. a stop sign's red octagon and a separate blue backing panel right behind it getting
+# matched as ice_formation) - same gap-tolerance concept as merge_overlapping_boxes(), reused
+# here for the cross-label case.
+CROSS_LABEL_GAP_PX = 30
+
+# Still required even under the gap-tolerance above: guards against a huge, low-confidence
+# background-texture match "swallowing" a small real detection just because its box happens
+# to sprawl close to or over it - the two boxes must be within this size ratio of each other.
+CROSS_LABEL_MAX_AREA_RATIO = 6.0
+
+
+def bbox_iou(a, b):
+    """Intersection over union of two (x, y, w, h) boxes."""
+
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if intersection == 0:
+        return 0.0
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def is_same_object(a_bbox, b_bbox):
+    """
+    Perception 2: decide whether two different-label detections are plausibly the same
+    physical object/mount - see CROSS_LABEL_GAP_PX and CROSS_LABEL_MAX_AREA_RATIO above.
+    """
+
+    area_a = a_bbox[2] * a_bbox[3]
+    area_b = b_bbox[2] * b_bbox[3]
+    if max(area_a, area_b) > CROSS_LABEL_MAX_AREA_RATIO * max(1, min(area_a, area_b)):
+        return False
+
+    if bbox_iou(a_bbox, b_bbox) >= LABEL_OVERLAP_IOU_THRESHOLD:
+        return True
+
+    ax, ay, aw, ah = a_bbox
+    bx, by, bw, bh = b_bbox
+    gap = CROSS_LABEL_GAP_PX
+    return not (ax + aw + gap < bx or bx + bw + gap < ax
+                or ay + ah + gap < by or by + bh + gap < ay)
+
+
+def suppress_overlapping_labels(detections, priority_labels=frozenset()):
+    """
+    Perception 2: when detections of DIFFERENT labels are plausibly the same physical object
+    (see is_same_object()) - one physical object/mount matching more than one HSV profile at
+    once, rather than several fragments of the same profile (that's merge_overlapping_boxes()
+    above) - keep only one and discard the rest.
+
+    Several of ARTIFACT_COLOR_PROFILES' ranges are deliberately similar (see that list's own
+    comment, e.g. green_alien vs toy_story_alien) and can both match the same pixels on one
+    object, reporting it as two or more different artefact types simultaneously instead of
+    one.
+
+    Within a group, a detection whose label is in 'priority_labels' always wins over one that
+    isn't, regardless of area - used for the stop sign (image_callback), whose dedicated
+    cascade classifier is a far more reliable identification than an incidental colour-profile
+    match landing on or near the same spot (e.g. its backing panel occasionally matching
+    ice_formation's "icy" range). Otherwise, area is used as the tie-break (the better colour
+    match for an object usually covers more of it) - the original per-contour pixel counts
+    aren't available any more once merge_overlapping_boxes() has already merged same-label
+    fragments into plain boxes.
+    """
+
+    if len(detections) <= 1:
+        return list(detections)
+
+    parent = list(range(len(detections)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(detections)):
+        for j in range(i + 1, len(detections)):
+            if is_same_object(detections[i].bbox, detections[j].bbox):
+                parent[find(i)] = find(j)
+
+    groups = {}
+    for i in range(len(detections)):
+        groups.setdefault(find(i), []).append(i)
+
+    kept = []
+    for indices in groups.values():
+        priority_indices = [i for i in indices if detections[i].label in priority_labels]
+        candidates = priority_indices or indices
+        best = max(candidates, key=lambda i: detections[i].bbox[2] * detections[i].bbox[3])
+        kept.append(detections[best])
+    return kept
+
+
 class PlannerType(Enum):
     ERROR = 0
     MOVE_FORWARDS = 1
@@ -133,6 +282,13 @@ Detection = namedtuple('Detection', ['label', 'bbox', 'color_rgb'])
 # from the Perception 1 dataset, since simulated lighting will shift these colours.
 # Some artefacts (e.g. green_alien vs toy_story_alien, white_sphere vs ice_formation)
 # have deliberately similar colours and may be confused with this simple approach.
+#
+# toy_story_alien and mossy_boulder are deliberately NOT included here: neither is actually
+# placed anywhere in mars_cave.sdf (checked directly against the world file), so every
+# detection that would appear under either label is guaranteed to be a false positive -
+# mostly wall/floor rock texture, and (for toy_story_alien specifically) a major contributor
+# to green_crystals/green_alien getting mislabeled, since its hue/value range overlapped both.
+# Dropping them removes that confusion entirely with zero loss of real detection capability.
 ARTIFACT_COLOR_PROFILES = [
     {
         'label': 'blue_cube',
@@ -156,13 +312,6 @@ ARTIFACT_COLOR_PROFILES = [
         'color_rgb': (0, 255, 140),
     },
     {
-        'label': 'toy_story_alien',
-        'hsv_lower': (25, 120, 30),
-        'hsv_upper': (50, 255, 140),
-        'min_area': 300,
-        'color_rgb': (0, 140, 70),
-    },
-    {
         'label': 'white_sphere',
         'hsv_lower': (95, 30, 200),
         'hsv_upper': (120, 140, 255),
@@ -177,16 +326,18 @@ ARTIFACT_COLOR_PROFILES = [
         'color_rgb': (180, 220, 255),
     },
     {
-        'label': 'mossy_boulder',
-        'hsv_lower': (8, 45, 35),
-        'hsv_upper': (42, 230, 210),
-        'min_area': 400,
-        'color_rgb': (140, 90, 20),
-    },
-    {
         'label': 'mushroom_blue',
-        'hsv_lower': (80, 40, 140),
-        'hsv_upper': (130, 180, 255),
+        # Narrowed from (80, 40, 140)-(130, 180, 255): that window was wide enough to fully
+        # contain ice_formation's, white_sphere's, AND blue_cube's hue ranges at once, and
+        # live testing confirmed mushroom_blue winning the cross-label tie-break against all
+        # three in separate runs. First pass (hue floor 115) cleared ice_formation (max 115)
+        # and white_sphere (max 120) but still left a 10-degree overlap with blue_cube
+        # (100-125) - live testing confirmed that's exactly where the mushroom's actual
+        # rendered colour sits, since it kept winning against blue_cube specifically even
+        # after the other two were fixed. Hue floor raised again, past blue_cube's ceiling
+        # (125) entirely this time.
+        'hsv_lower': (128, 90, 150),
+        'hsv_upper': (155, 200, 255),
         'min_area': 300,
         'color_rgb': (255, 120, 255),
     },
@@ -217,6 +368,26 @@ CAMERA_DEPTH_OPTICAL_FRAME = 'camera_depth_optical_frame'
 # Perception 3: repeated observations of the same artefact type within this distance (metres)
 # of an existing estimate are merged into it (running average) rather than creating a new one.
 ARTIFACT_CLUSTER_DISTANCE_M = 1.5
+
+# Perception/Planning 3 robustness: a same-label cluster within this distance (metres) of an
+# existing one is treated as a repeat sighting of the same physical object (drifted further
+# than ARTIFACT_CLUSTER_DISTANCE_M due to localisation noise) and merged into it too, as long as
+# that existing cluster is already CONFIRMED (see ARTIFACT_CONFIRMATION_OBSERVATIONS) - see
+# add_artifact_observation(). Gating on "already confirmed" (rather than applying this wider
+# radius unconditionally) means two genuinely distinct same-label artefacts placed closer than
+# this to each other still each get a chance to independently confirm themselves, instead of
+# being merged into one from the very first sighting. Deliberately wider than
+# ARTIFACT_CLUSTER_DISTANCE_M to absorb that drift, while still tighter than the spacing between
+# genuinely distinct artefacts. Previously only applied to the 3 inspection labels (as
+# INSPECTION_DUPLICATE_RADIUS_M) - every artefact type ballooned unbounded ids from drifted
+# re-sightings without it, not just the inspected ones, so it's now applied to all of them here.
+ARTIFACT_DUPLICATE_RADIUS_M = 3.0
+
+# Perception 3 robustness: a single-frame colour/contour blob can be a stray false positive
+# (lighting glare, a misclassified rock texture) rather than a real artefact. A cluster isn't
+# logged, counted, or offered up for inspection (see find_inspection_target()) until it reaches
+# this many merged observations - filters out one-off noise without needing a smarter detector.
+ARTIFACT_CONFIRMATION_OBSERVATIONS = 3
 
 # Planning 1: frontier-based exploration.
 # Occupancy grid cells >= this value are treated as occupied (cells are 0-100, or -1 if unknown).
@@ -262,22 +433,17 @@ INSPECTION_STANDOFF_DISTANCE_M = 2.0
 # abandoning that artefact and resuming exploration.
 INSPECTION_MAX_RETRIES = 1
 
-# Planning 3 robustness: Perception 3's clustering (ARTIFACT_CLUSTER_DISTANCE_M) can
-# over-segment one physical artefact into several same-label clusters if repeated
-# localisation estimates for it land further apart than that threshold (observed with the
-# colour-blob detector, especially at close range where many detections arrive per second).
-# A same-label cluster within this distance of one we've already visited/abandoned is treated
-# as the same physical object rather than a new one, so we don't keep "rediscovering" and
-# re-approaching it under a new id. Deliberately wider than ARTIFACT_CLUSTER_DISTANCE_M (1.5m)
-# to absorb that drift, while still being tighter than the spacing between distinct artefacts.
-INSPECTION_DUPLICATE_RADIUS_M = 3.0
-
 # Planning 1 robustness: how many random points planner_random_walk() tries before giving up
 # and holding position, when looking for one that's actually navigable (see is_point_navigable()).
 RANDOM_WALK_MAX_ATTEMPTS = 30
 
 # How often (seconds) to print the [STATUS] heartbeat - see log_status().
 STATUS_LOG_PERIOD_S = 30.0
+
+# How often (seconds) to publish the GUI status feed - see publish_gui_status(). Much more
+# frequent than STATUS_LOG_PERIOD_S since this drives a live-updating display rather than a
+# human-readable log heartbeat, where that cadence would feel sluggish.
+GUI_STATUS_PERIOD_S = 1.0
 
 # Planning 1/3 robustness: Nav2's own recovery behaviour tree can retry a difficult goal (e.g.
 # "Failed to make progress") more or less indefinitely without ever reporting success or
@@ -290,6 +456,41 @@ STATUS_LOG_PERIOD_S = 30.0
 # recovery behaviours (spin/backup/wait) don't get enough cycles to actually resolve a
 # difficult-but-recoverable spot before we give up on it ourselves.
 GOAL_TIMEOUT_S = 45.0
+
+# Planning 3 robustness: RETURN_HOME's distance-scaled timeout assumes the robot can average at
+# least this speed (m/s) over the whole trip home - see planner_return_home(). Deliberately
+# conservative (well under max_vel_x in nav2_params.yaml) to leave room for turns, narrow
+# corridors, and the occasional recovery cycle without falsely running out of patience.
+RETURN_HOME_MIN_SPEED_MPS = 0.3
+
+# Planning 1/3 robustness: a companion to GOAL_TIMEOUT_S that reacts to Nav2's own
+# distance_remaining feedback (see feedback_callback()) rather than waiting out a flat
+# duration regardless of whether the robot is actually making progress. If distance_remaining
+# hasn't decreased by more than GOAL_PROGRESS_EPSILON_M for this many seconds, the goal is
+# abandoned early instead of waiting the full GOAL_TIMEOUT_S.
+#
+# Deliberately NOT set close to GOAL_TIMEOUT_S's lesson learned in reverse: too short a value
+# here would repeat that same mistake - cutting a goal off before Nav2's own progress_checker
+# (movement_time_allowance=15s in nav2_params.yaml) has even finished its first stall-detect
+# cycle, let alone had a chance to actually run a recovery behaviour (spin/backup/wait) and
+# resume making progress.
+#
+# Raised from 30s (2x movement_time_allowance, room for one detect-then-recover cycle) after
+# live testing: once the global costmap's rolling_window bug was fixed, the robot started
+# attempting much longer frontier goals (30-50m, across the whole explored map instead of a
+# ~15m window) - and over that much longer route, through a cave whose map is still being
+# actively discovered, there's more opportunity to hit one genuinely tricky spot (a tight
+# corridor, a junction, a plan disrupted by newly-discovered obstacles) that needs more than
+# one recovery cycle to resolve. All 3 early-abandons observed in that test run fired at
+# 30-32s on long-distance goals that were otherwise making real progress - i.e. Nav2's single
+# recovery cycle hadn't finished, not that the goal was truly dead. 40s gives room for closer
+# to two cycles, while still meaningfully faster than the 45s hard backstop for a goal that
+# really is stuck.
+GOAL_PROGRESS_STALL_S = 40.0
+
+# How much (metres) distance_remaining must decrease to count as "real" forward progress,
+# rather than feedback noise/jitter resetting the GOAL_PROGRESS_STALL_S timer forever.
+GOAL_PROGRESS_EPSILON_M = 0.15
 
 
 class CaveExplorer(Node):
@@ -377,6 +578,37 @@ class CaveExplorer(Node):
         # corrupting the state of whatever goal we've since moved on to.
         self.goal_generation_ = 0
         self.goal_sent_time_ = None
+        # The flat watchdog ceiling for the current goal - normally GOAL_TIMEOUT_S, but
+        # overridden per-goal by planner_go_to_pose2d()'s 'timeout_s' - see
+        # planner_return_home() for why RETURN_HOME needs a larger one.
+        self.goal_timeout_s_ = GOAL_TIMEOUT_S
+        # The in-flight goal's handle (set once accepted - see goal_response_callback), so
+        # main_loop's watchdog can actually cancel it with Nav2 when giving up, rather than
+        # just locally pretending it's gone while Nav2 keeps executing it regardless.
+        self.current_goal_handle_ = None
+
+        # Robustness: tracks progress on the current goal via the robot's own straight-line
+        # distance to the goal (x, y) - computed fresh from get_pose_2d() in main_loop's
+        # watchdog, NOT from Nav2's distance_remaining feedback. distance_remaining is the
+        # length of Nav2's current PLAN, which gets recomputed every time the costmap updates
+        # (frequent, since SLAM keeps discovering new area mid-drive) - a replan that finds a
+        # slightly longer detour is needed can make it plateau or tick up for a stretch even
+        # while the robot is genuinely, correctly moving toward the goal. The longer the goal,
+        # the more replans happen en route, the more likely this is to look like a stall when
+        # it isn't one - confirmed live: every false stall observed was on a goal 30m+ away,
+        # abandoned right at the threshold with the robot already having covered over half the
+        # distance. Straight-line distance to the fixed goal point can't be fooled this way -
+        # it only decreases as the robot genuinely gets physically closer.
+        self.goal_target_x_ = None
+        self.goal_target_y_ = None
+        self.goal_progress_distance_ = None
+        self.goal_progress_time_ = None
+
+        # Logging: straight-line distance to the current goal at the moment it was sent (used
+        # to report per-leg average speed when it concludes - see log_goal_outcome()), and the
+        # running total across the whole mission (used for MISSION COMPLETE's overall average).
+        self.goal_initial_distance_m_ = None
+        self.total_distance_m_ = 0.0
 
         # Publisher for the goal pose visualisation
         self.goal_pose_vis_ = self.create_publisher(PoseStamped, 'goal_pose', 1)
@@ -411,12 +643,40 @@ class CaveExplorer(Node):
         self.save_dataset_image_srv_ = self.create_service(
             Trigger, 'save_dataset_image', self.save_dataset_image_callback)
 
+        # GUI control: the robot does nothing in main_loop() until this is triggered (e.g. by
+        # the GUI's "Start Exploring" button), rather than autonomously starting the instant
+        # the node launches. Perception (image_callback etc.) keeps running regardless, so
+        # artefacts already in view get detected immediately once exploration does start.
+        self.mission_started_ = False
+        self.start_mission_srv_ = self.create_service(
+            Trigger, 'start_mission', self.start_mission_callback)
+
+        # GUI control: pause/resume - see pause_mission_callback()/resume_mission_callback().
+        self.mission_paused_ = False
+        self.pause_mission_srv_ = self.create_service(
+            Trigger, 'pause_mission', self.pause_mission_callback)
+        self.resume_mission_srv_ = self.create_service(
+            Trigger, 'resume_mission', self.resume_mission_callback)
+
+        # GUI control: skip straight to RETURN_HOME - see force_return_home_callback().
+        self.force_return_home_srv_ = self.create_service(
+            Trigger, 'force_return_home', self.force_return_home_callback)
+
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
 
-        # Periodic status heartbeat (elapsed time + progress counts) - see log_status()
-        self.start_time_ = self.get_clock().now()
+        # Periodic status heartbeat (elapsed time + progress counts) - see log_status(). Set
+        # once start_mission_callback() actually starts the clock, not at node construction,
+        # so elapsed time doesn't include time spent waiting for the GUI's start button.
+        self.start_time_ = None
         self.status_timer_ = self.create_timer(STATUS_LOG_PERIOD_S, self.log_status)
+
+        # GUI data feed: a single JSON-encoded topic (mission status + the full artefact
+        # list), published frequently enough for a live-updating display - see
+        # publish_gui_status(). Kept as one plain std_msgs/String rather than a custom .msg
+        # package, to avoid an interfaces-package rebuild for what's purely a GUI convenience.
+        self.gui_status_pub_ = self.create_publisher(String, 'gui_status', 1)
+        self.gui_status_timer_ = self.create_timer(GUI_STATUS_PERIOD_S, self.publish_gui_status)
     
     def get_pose_2d(self):
         """Get the 2d pose of the robot"""
@@ -490,8 +750,13 @@ class CaveExplorer(Node):
         self.latest_image_ = image
         self.maybe_save_dataset_image(image)
 
-        # Perception 2: run all detectors and merge their results
-        detections = self.detect_stop_signs(image) + self.detect_color_artifacts(image)
+        # Perception 2: run all detectors and merge their results. The stop sign's dedicated
+        # cascade classifier is given priority over any colour-profile detection landing on
+        # the same spot (see suppress_overlapping_labels()'s 'priority_labels') - e.g. its
+        # white border/pole occasionally gets mistaken for ice_formation's "icy" colour range.
+        detections = suppress_overlapping_labels(
+            self.detect_stop_signs(image) + self.detect_color_artifacts(image),
+            priority_labels={'stop_sign'})
 
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
         # Since the "image_callback" and "main_loop" methods can run at the same time you should protect any shared variables
@@ -539,6 +804,11 @@ class CaveExplorer(Node):
         """
         Perception 2: detect the non-stop-sign artefact types using HSV colour thresholding
         and contour/blob detection, based on ARTIFACT_COLOR_PROFILES.
+
+        Several profiles have deliberately similar colour ranges (see that list's own comment),
+        so the same object can match more than one at once - suppress_overlapping_labels()
+        resolves that by keeping only the best (largest-area) match per overlapping region,
+        rather than reporting one physical object as several different artefact types.
         """
 
         hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -562,7 +832,7 @@ class CaveExplorer(Node):
             for bbox in merge_overlapping_boxes(boxes):
                 detections.append(Detection(profile['label'], bbox, profile['color_rgb']))
 
-        return detections
+        return suppress_overlapping_labels(detections)
 
     def maybe_save_dataset_image(self, image):
         """Perception 1: save the current frame to 'dataset_dir_' if enough time has passed"""
@@ -604,6 +874,90 @@ class CaveExplorer(Node):
         filename = self.save_image_to_dataset(self.latest_image_)
         response.success = True
         response.message = f'Saved to {filename}'
+        return response
+
+    def start_mission_callback(self, request, response):
+        """
+        Service to start autonomous exploration - see mission_started_'s comment for why this
+        is a manual trigger rather than starting the instant the node launches.
+        """
+
+        if self.mission_started_:
+            response.success = False
+            response.message = 'Mission already started'
+            return response
+
+        self.mission_started_ = True
+        self.start_time_ = self.get_clock().now()
+        self.get_logger().info('Mission started')
+        response.success = True
+        response.message = 'Mission started'
+        return response
+
+    def pause_mission_callback(self, request, response):
+        """
+        Service to pause: main_loop() returns immediately while paused (see its gate), and the
+        in-flight goal is cancelled so the robot actually stops rather than continuing to
+        drive toward wherever it was already headed.
+
+        RETURN_HOME is deliberately left running rather than cancelled: main_loop's
+        RETURN_HOME result-handling can't tell a manual cancellation apart from a genuine
+        failure, so cancelling it here would risk declaring MISSION COMPLETE with "didn't
+        quite reach base" on resume, even though the robot was simply paused a few metres from
+        home. Letting it finish the (usually short) final leg avoids that, at the cost of not
+        instantly freezing during that one specific window.
+        """
+
+        if not self.mission_started_:
+            response.success = False
+            response.message = 'Mission not started yet'
+            return response
+        if self.mission_paused_:
+            response.success = False
+            response.message = 'Already paused'
+            return response
+
+        self.mission_paused_ = True
+        if self.planner_type_ != PlannerType.RETURN_HOME and self.current_goal_handle_ is not None:
+            self.current_goal_handle_.cancel_goal_async()
+        self.get_logger().info('Mission paused')
+        response.success = True
+        response.message = 'Mission paused'
+        return response
+
+    def resume_mission_callback(self, request, response):
+        """Service to resume after pause_mission_callback() - main_loop() picks up normally."""
+
+        if not self.mission_paused_:
+            response.success = False
+            response.message = 'Not paused'
+            return response
+
+        self.mission_paused_ = False
+        self.get_logger().info('Mission resumed')
+        response.success = True
+        response.message = 'Mission resumed'
+        return response
+
+    def force_return_home_callback(self, request, response):
+        """
+        Service to skip straight to RETURN_HOME, as if exploration had completed naturally.
+        A pending, already-confirmed inspection target is still visited first (main_loop's
+        normal planner-selection order), rather than abruptly abandoning something already
+        decided - this only short-circuits further EXPLORE_FRONTIER goals, not inspection.
+        """
+
+        if not self.mission_started_:
+            response.success = False
+            response.message = 'Mission not started yet'
+            return response
+
+        self.exploration_complete_ = True
+        if self.planner_type_ == PlannerType.EXPLORE_FRONTIER and self.current_goal_handle_ is not None:
+            self.current_goal_handle_.cancel_goal_async()
+        self.get_logger().info('Force return-home triggered')
+        response.success = True
+        response.message = 'Returning home'
         return response
 
     def localise_artifacts(self, detections):
@@ -671,9 +1025,22 @@ class CaveExplorer(Node):
     def add_artifact_observation(self, label, position):
         """
         Perception 3: merge a new observed position for 'label' into an existing nearby cluster
-        (running average), or start a new cluster if it's not close to any existing one.
+        (running average), or start a new candidate cluster if it's not close to any existing one.
+
+        Two merge radii, in increasing order of looseness:
+        - ARTIFACT_CLUSTER_DISTANCE_M: always merge a same-label cluster this close - a normal
+          repeat sighting from a similar vantage point.
+        - ARTIFACT_DUPLICATE_RADIUS_M: merge a same-label cluster this close ONLY if it's
+          already CONFIRMED (see ARTIFACT_CONFIRMATION_OBSERVATIONS) - absorbs drift-induced
+          stray detections of an artefact we already know is real, without merging two
+          genuinely distinct same-label artefacts placed closer than this to each other before
+          either has had a chance to independently confirm itself.
+
+        Logging/counting a brand new cluster is deferred until it reaches
+        ARTIFACT_CONFIRMATION_OBSERVATIONS merged observations - see that constant's comment.
         """
 
+        best_cluster, best_distance = None, None
         for cluster in self.artifact_clusters_:
             if cluster['label'] != label:
                 continue
@@ -682,17 +1049,28 @@ class CaveExplorer(Node):
             dy = position.y - cluster['position'].y
             dz = position.z - cluster['position'].z
             distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if distance <= ARTIFACT_CLUSTER_DISTANCE_M:
-                n = cluster['num_observations']
-                cluster['position'].x = (cluster['position'].x * n + position.x) / (n + 1)
-                cluster['position'].y = (cluster['position'].y * n + position.y) / (n + 1)
-                cluster['position'].z = (cluster['position'].z * n + position.z) / (n + 1)
-                cluster['num_observations'] += 1
-                return
+
+            is_confirmed = cluster['num_observations'] >= ARTIFACT_CONFIRMATION_OBSERVATIONS
+            radius = ARTIFACT_DUPLICATE_RADIUS_M if is_confirmed else ARTIFACT_CLUSTER_DISTANCE_M
+            if distance <= radius and (best_distance is None or distance < best_distance):
+                best_cluster, best_distance = cluster, distance
+
+        if best_cluster is not None:
+            n = best_cluster['num_observations']
+            best_cluster['position'].x = (best_cluster['position'].x * n + position.x) / (n + 1)
+            best_cluster['position'].y = (best_cluster['position'].y * n + position.y) / (n + 1)
+            best_cluster['position'].z = (best_cluster['position'].z * n + position.z) / (n + 1)
+            best_cluster['num_observations'] = n + 1
+            if best_cluster['num_observations'] == ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                self.get_logger().info(
+                    f"    FOUND: {label} #{best_cluster['id']} at "
+                    f"({best_cluster['position'].x:.1f}, {best_cluster['position'].y:.1f})")
+            return
 
         # Planning 3: a stable id per cluster (distinct from its position in the list, which
         # isn't guaranteed to stay fixed), used to track which specific artefacts have
-        # already been inspected - see visited_artifact_ids_.
+        # already been inspected - see visited_artifact_ids_. Not logged yet - see
+        # ARTIFACT_CONFIRMATION_OBSERVATIONS - in case this is a one-off false positive.
         cluster_id = self.next_artifact_cluster_id_
         self.next_artifact_cluster_id_ += 1
 
@@ -702,8 +1080,6 @@ class CaveExplorer(Node):
             'position': Point(x=position.x, y=position.y, z=position.z),
             'num_observations': 1,
         })
-        self.get_logger().info(
-            f'[DISCOVER] {label} #{cluster_id} at ({position.x:.1f}, {position.y:.1f})')
 
     def publish_artifact_markers(self):
         """Perception 3: publish one coloured sphere + text label per clustered artefact estimate"""
@@ -797,27 +1173,7 @@ class CaveExplorer(Node):
         free = (grid >= 0) & (grid < FRONTIER_OCCUPIED_THRESHOLD)
         unknown = grid == -1
 
-        # OR together the unknown mask shifted by each of the 8 neighbour offsets, to find
-        # (without a slow per-cell python loop) which free cells have an unknown neighbour
-        neighbours_unknown = np.zeros_like(unknown)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                shifted = np.roll(np.roll(unknown, dr, axis=0), dc, axis=1)
-                # np.roll wraps around; clear the wrapped-in edge so it isn't mistaken for a
-                # real neighbour on the opposite side of the map
-                if dr == -1:
-                    shifted[-1, :] = False
-                elif dr == 1:
-                    shifted[0, :] = False
-                if dc == -1:
-                    shifted[:, -1] = False
-                elif dc == 1:
-                    shifted[:, 0] = False
-                neighbours_unknown |= shifted
-
-        return free & neighbours_unknown
+        return free & dilate8_mask(unknown)
 
     def cluster_frontier_cells(self, frontier_mask):
         """Planning 1: group frontier cells into connected (8-connectivity) clusters via BFS"""
@@ -859,6 +1215,17 @@ class CaveExplorer(Node):
         rather than straight-line distance - which can be badly misleading in a branching
         maze (a frontier might look close as the crow flies but actually require a long
         detour through the only real corridor, or vice versa).
+
+        Vectorised as a wavefront expansion (dilate8_mask(), one ring of cells per iteration)
+        rather than a per-cell python-loop BFS: this is called on every frontier AND every
+        inspection-target goal pick (see planner_inspect_artifact()), and profiling showed the
+        per-cell version taking 170ms-1000ms+ on realistic map sizes - long enough to noticeably
+        starve this node's own tf2/camera callbacks (and compete for CPU with the rest of the
+        Nav2 stack) each time it ran, which can itself contribute to the kind of system-wide
+        timing hiccups (stale transforms, missed control loops) that looked like unrelated
+        environment flakiness. The vectorised version is 3-10x faster and scales far better as
+        the map grows over a long run (growing the full map was also made possible by the
+        global_costmap rolling_window fix - see nav2_params.yaml).
         """
 
         grid = self.map_grid_
@@ -870,19 +1237,16 @@ class CaveExplorer(Node):
             return dist
 
         dist[start_row, start_col] = 0
-        queue = deque([(start_row, start_col)])
-        while queue:
-            r, c = queue.popleft()
-            d = dist[r, c]
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < height and 0 <= nc < width \
-                            and free[nr, nc] and dist[nr, nc] == -1:
-                        dist[nr, nc] = d + 1
-                        queue.append((nr, nc))
+        frontier = np.zeros((height, width), dtype=bool)
+        frontier[start_row, start_col] = True
+        d = 0
+        while frontier.any():
+            d += 1
+            expanded = dilate8_mask(frontier) & free & (dist == -1)
+            if not expanded.any():
+                break
+            dist[expanded] = d
+            frontier = expanded
 
         return dist
 
@@ -911,7 +1275,6 @@ class CaveExplorer(Node):
 
         robot_row, robot_col = self.world_to_grid(robot_pose.x, robot_pose.y)
         path_distance_grid = self.compute_path_distance_grid(robot_row, robot_col)
-        height, width = path_distance_grid.shape
 
         # Drop goals older than the revisit window - see FRONTIER_REVISIT_WINDOW_S's comment
         now = self.get_clock().now()
@@ -927,31 +1290,49 @@ class CaveExplorer(Node):
 
             mean_row = sum(r for r, c in cluster) / len(cluster)
             mean_col = sum(c for r, c in cluster) / len(cluster)
-            world_x, world_y = self.grid_to_world(mean_row, mean_col)
+
+            # Snap to the actual cluster cell nearest the centroid, rather than sending Nav2
+            # the raw arithmetic mean position directly - for a non-convex cluster (wraps
+            # around a corner, L-shaped), the mean can land outside the free/frontier cells
+            # altogether, inside a wall or unknown space. Snapping guarantees the goal is one
+            # of the real frontier cells found above, which is by definition free space.
+            snap_row, snap_col = min(
+                cluster, key=lambda rc: (rc[0] - mean_row) ** 2 + (rc[1] - mean_col) ** 2)
+            world_x, world_y = self.grid_to_world(snap_row, snap_col)
 
             if any(math.hypot(world_x - gx, world_y - gy) < FRONTIER_REVISIT_RADIUS_M
                    for gx, gy, _ in self.recent_frontier_goals_):
                 continue
 
-            row_idx = min(max(int(round(mean_row)), 0), height - 1)
-            col_idx = min(max(int(round(mean_col)), 0), width - 1)
-            path_cells = path_distance_grid[row_idx, col_idx]
-            # Not reachable through known free space at all (e.g. an isolated noise pocket) -
-            # still include it (for visualisation) but make sure it never scores highest
-            distance = path_cells * self.map_resolution_ if path_cells >= 0 else float('inf')
+            path_cells = path_distance_grid[snap_row, snap_col]
+            # Not reachable through known free space at all (e.g. an isolated noise pocket
+            # behind a wall) - still included in 'candidates' for visualisation, but excluded
+            # from 'reachable' below so it can never actually be chosen. This is a genuine
+            # reachability pre-check using the BFS data already computed above, rather than
+            # just letting an unreachable frontier's score trend toward (but never quite hit)
+            # zero - which could still let it be picked if it ends up the only candidate once
+            # nearby real frontiers are excluded by the revisit window, wasting a full
+            # GOAL_TIMEOUT_S finding out Nav2 can't reach it either.
+            reachable = path_cells >= 0
+            distance = path_cells * self.map_resolution_ if reachable else float('inf')
+            score = len(cluster) / (1.0 + distance / FRONTIER_DISTANCE_SCALE_M) if reachable else 0.0
 
-            score = len(cluster) / (1.0 + distance / FRONTIER_DISTANCE_SCALE_M)
             candidates.append({
                 'position': (world_x, world_y),
                 'size': len(cluster),
                 'distance': distance,
                 'score': score,
+                'reachable': reachable,
             })
 
         if not candidates:
             return None, []
 
-        chosen = max(candidates, key=lambda c: c['score'])
+        reachable_candidates = [c for c in candidates if c['reachable']]
+        if not reachable_candidates:
+            return None, candidates
+
+        chosen = max(reachable_candidates, key=lambda c: c['score'])
         return chosen, candidates
 
     def publish_frontier_markers(self, chosen, candidates):
@@ -1011,18 +1392,18 @@ class CaveExplorer(Node):
             # planner_random_goal()'s fixed coordinate list) it always finds a valid point even
             # very early on (e.g. before the first map message arrives) or on an unfamiliar map
             if self.map_grid_ is None:
-                self.get_logger().info('No map yet - taking a random step until SLAM has data')
+                self.get_logger().info('    (no map yet - taking a random step until SLAM has data)')
             else:
                 self.no_frontier_streak_ += 1
                 if self.no_frontier_streak_ >= EXPLORATION_COMPLETE_STREAK:
                     if not self.exploration_complete_:
                         self.get_logger().info(
-                            f'EXPLORATION COMPLETE: no frontiers found for '
+                            f'    EXPLORATION COMPLETE: no frontiers found for '
                             f'{self.no_frontier_streak_} consecutive checks - the cave appears '
                             'to be fully mapped')
                     self.exploration_complete_ = True
                 else:
-                    self.get_logger().info('No frontiers right now - taking a random step')
+                    self.get_logger().info('    (no frontiers right now - taking a random step)')
             self.planner_random_walk()
             return
 
@@ -1045,11 +1426,13 @@ class CaveExplorer(Node):
         for cluster in self.artifact_clusters_:
             if cluster['label'] not in INSPECTION_ARTIFACT_LABELS:
                 continue
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue  # not yet confirmed - could still be a one-off false positive
             if cluster['id'] in self.visited_artifact_ids_ or cluster['id'] in self.abandoned_artifact_ids_:
                 continue
             if self.is_duplicate_of_handled_artifact(cluster):
                 # Treat it as the same physical artefact as one we've already dealt with (see
-                # INSPECTION_DUPLICATE_RADIUS_M) - mark it visited too, so this id (and any
+                # ARTIFACT_DUPLICATE_RADIUS_M) - mark it visited too, so this id (and any
                 # future ones that spawn near it) won't keep coming back as a "new" target
                 self.visited_artifact_ids_.add(cluster['id'])
                 continue
@@ -1066,7 +1449,7 @@ class CaveExplorer(Node):
                 continue
             dx = cluster['position'].x - other['position'].x
             dy = cluster['position'].y - other['position'].y
-            if math.hypot(dx, dy) < INSPECTION_DUPLICATE_RADIUS_M:
+            if math.hypot(dx, dy) < ARTIFACT_DUPLICATE_RADIUS_M:
                 return True
         return False
 
@@ -1081,6 +1464,8 @@ class CaveExplorer(Node):
         for cluster in self.artifact_clusters_:
             if cluster['label'] not in INSPECTION_ARTIFACT_LABELS:
                 continue
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue  # not yet confirmed - don't show an unconfirmed detection as "pending"
 
             if cluster['id'] in self.visited_artifact_ids_:
                 color = (0.0, 1.0, 0.0)
@@ -1113,11 +1498,13 @@ class CaveExplorer(Node):
 
         Tries a handful of candidate approach angles around the artefact, starting with
         approaching from the robot's current side (shortest path) and otherwise spaced around
-        it, using the first one that validates as free space in the current map (see
-        is_point_navigable()). A standoff point computed from the artefact's position alone can
-        otherwise land inside a wall or in unexplored space if the artefact happens to be close
-        to one - which Nav2's global planner then can't find a path to at all, rather than just
-        navigating there poorly.
+        it, using the first one that validates as (a) free space in the current map (see
+        is_point_navigable()) AND (b) actually reachable from the robot's current position
+        through currently-known free space (reusing the same BFS path-distance grid frontier
+        selection uses - see compute_path_distance_grid()). A standoff point computed from the
+        artefact's position alone can otherwise land inside a wall, in unexplored space, or on
+        the far side of a wall with no known connecting path - which Nav2's global planner then
+        can't find a path to at all, rather than just navigating there poorly.
         """
 
         robot_pose = self.get_pose_2d()
@@ -1129,6 +1516,18 @@ class CaveExplorer(Node):
         dy = robot_pose.y - target.y
         base_angle = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-3 else 0.0
 
+        path_distance_grid = None
+        if self.map_grid_ is not None:
+            robot_row, robot_col = self.world_to_grid(robot_pose.x, robot_pose.y)
+            path_distance_grid = self.compute_path_distance_grid(robot_row, robot_col)
+
+        def is_reachable(x, y):
+            if path_distance_grid is None:
+                return True
+            row, col = self.world_to_grid(x, y)
+            height, width = path_distance_grid.shape
+            return 0 <= row < height and 0 <= col < width and path_distance_grid[row, col] >= 0
+
         candidate_offsets = [0.0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2,
                              3 * math.pi / 4, -3 * math.pi / 4, math.pi]
         goal_x = goal_y = None
@@ -1136,22 +1535,88 @@ class CaveExplorer(Node):
             angle = base_angle + offset
             candidate_x = target.x + math.cos(angle) * INSPECTION_STANDOFF_DISTANCE_M
             candidate_y = target.y + math.sin(angle) * INSPECTION_STANDOFF_DISTANCE_M
-            if self.is_point_navigable(candidate_x, candidate_y):
+            if self.is_point_navigable(candidate_x, candidate_y) and is_reachable(candidate_x, candidate_y):
                 goal_x, goal_y = candidate_x, candidate_y
                 break
 
         if goal_x is None:
             # Nothing validated (e.g. map not built yet, or the artefact is tightly enclosed) -
             # fall back to the direct approach anyway; the goal watchdog (GOAL_TIMEOUT_S) will
-            # recover if Nav2 genuinely can't reach it
+            # recover if Nav2 genuinely can't reach it. Logged so we have evidence of how often
+            # this unvalidated fallback actually fires, rather than just suspecting it might.
+            self.get_logger().warn(
+                f"    (no validated standoff point for {self.inspection_target_['label']} "
+                f"#{self.inspection_target_['id']} - falling back to unvalidated direct approach)")
             goal_x = target.x + math.cos(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
             goal_y = target.y + math.sin(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
 
         theta = math.atan2(target.y - goal_y, target.x - goal_x)  # face the artefact
         self.planner_go_to_pose2d(Pose2D(x=goal_x, y=goal_y, theta=theta))
 
-    def planner_go_to_pose2d(self, pose2d):
-        """Go to a provided 2d pose"""
+    def log_episode_start(self, mode_label):
+        """
+        Logging only: print a divider and a MODE header to mark the start of a new decision
+        cycle - every line until the next one belongs to this cycle (heading out, discoveries
+        en route, the outcome, and the inspection/mission result it led to).
+        """
+
+        self.get_logger().info('-' * 54)
+        self.get_logger().info(f'MODE: {mode_label}')
+
+    def log_goal_outcome(self, outcome_text):
+        """
+        Logging only: report how the current goal concluded - elapsed time, straight-line
+        distance, and average speed for this leg - and add that distance to the mission-wide
+        running total (see total_distance_m_, used by MISSION COMPLETE's overall average).
+        Called from every place a goal can conclude: goal_response_callback (rejected),
+        goal_reached_callback (reached/failed), and abandon_current_goal() (timed out/no
+        progress/preempted).
+        """
+
+        elapsed_s = (self.get_clock().now() - self.goal_sent_time_).nanoseconds / 1e9 \
+            if self.goal_sent_time_ is not None else 0.0
+
+        if self.goal_initial_distance_m_ is not None and elapsed_s > 0:
+            avg_speed = self.goal_initial_distance_m_ / elapsed_s
+            self.get_logger().info(
+                f'    <- {outcome_text} in {elapsed_s:.0f}s '
+                f'({self.goal_initial_distance_m_:.1f}m, avg {avg_speed:.2f} m/s)')
+            self.total_distance_m_ += self.goal_initial_distance_m_
+        else:
+            self.get_logger().info(f'    <- {outcome_text}')
+
+    def abandon_current_goal(self, outcome_text='abandoned'):
+        """
+        Give up on the in-flight Nav2 goal: cancel it with Nav2 (so it actually stops trying,
+        rather than continuing to execute in the background while we've locally moved on to
+        something else) and bump goal_generation_ (so a late response/result callback for it
+        is recognised as stale and ignored, even on the one path that doesn't immediately send
+        a replacement goal - RETURN_HOME's mission-complete branch, which just returns).
+
+        Without this, a goal we'd given up on could still actually succeed with Nav2 minutes
+        later, update last_goal_succeeded_/ready_for_next_goal_ out from under whatever we've
+        since moved on to, and (for the mission-complete case) make the final [MISSION
+        COMPLETE] log wrongly claim "didn't quite reach base" when it actually did, just later
+        than our patience allowed.
+        """
+
+        self.log_goal_outcome(outcome_text)
+        if self.current_goal_handle_ is not None:
+            self.current_goal_handle_.cancel_goal_async()
+            self.current_goal_handle_ = None
+        self.goal_generation_ += 1
+        self.last_goal_succeeded_ = False
+        self.ready_for_next_goal_ = True
+        self.goal_sent_time_ = None
+
+    def planner_go_to_pose2d(self, pose2d, timeout_s=GOAL_TIMEOUT_S):
+        """
+        Go to a provided 2d pose.
+
+        'timeout_s' overrides the flat watchdog ceiling (see main_loop's watchdog) for this
+        goal specifically - see planner_return_home() for why RETURN_HOME needs a larger,
+        distance-scaled one instead of the default.
+        """
 
         # Send a goal to navigate_to_pose with self.nav2_action_client_
         action_goal = NavigateToPose.Goal()
@@ -1162,12 +1627,6 @@ class CaveExplorer(Node):
         # Publish visualisation
         self.goal_pose_vis_.publish(action_goal.pose)
 
-        # Decide whether to show feedback or not
-        if self.get_parameter('print_feedback').value:
-            feedback_method = self.feedback_callback
-        else:
-            feedback_method = None
-
         # Send goal to action server. Tag this goal with a generation number, and have the
         # callbacks below check it against self.goal_generation_ before acting - if the
         # watchdog in main_loop() has since given up on this goal and moved on, these would
@@ -1175,11 +1634,26 @@ class CaveExplorer(Node):
         self.goal_generation_ += 1
         generation = self.goal_generation_
         self.goal_sent_time_ = self.get_clock().now()
+        self.goal_timeout_s_ = timeout_s
 
-        self.get_logger().info(f'  -> goal ({pose2d.x:.2f}, {pose2d.y:.2f})')
+        # Progress tracking for this goal starts fresh - see GOAL_PROGRESS_STALL_S and
+        # goal_target_x_/goal_target_y_'s comment for why this is based on the robot's own
+        # pose rather than Nav2's distance_remaining feedback.
+        self.goal_target_x_ = pose2d.x
+        self.goal_target_y_ = pose2d.y
+        self.goal_progress_distance_ = None
+        self.goal_progress_time_ = self.goal_sent_time_
+
+        # Logging only (see log_goal_outcome()) - straight-line distance to this goal right
+        # now, used to report this leg's average speed once it concludes.
+        robot_pose = self.get_pose_2d()
+        self.goal_initial_distance_m_ = math.hypot(pose2d.x - robot_pose.x, pose2d.y - robot_pose.y) \
+            if robot_pose is not None else None
+
+        self.get_logger().info(f'    -> heading to ({pose2d.x:.2f}, {pose2d.y:.2f})')
         self.send_goal_future_ = self.nav2_action_client_.send_goal_async(
             action_goal,
-            feedback_callback=feedback_method)
+            feedback_callback=functools.partial(self.feedback_callback, generation=generation))
         self.send_goal_future_.add_done_callback(
             functools.partial(self.goal_response_callback, generation=generation))
 
@@ -1191,22 +1665,33 @@ class CaveExplorer(Node):
 
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().info('  <- rejected')
+            self.log_goal_outcome('rejected')
             self.last_goal_succeeded_ = False
             self.ready_for_next_goal_ = True
             return
+
+        # Keep a handle to the in-flight goal so main_loop's watchdog can actually cancel it
+        # with Nav2 (see current_goal_handle_'s comment) rather than just locally pretending
+        # it's gone while Nav2 keeps driving it in the background.
+        self.current_goal_handle_ = goal_handle
 
         # Goal accepted: get result when it's completed
         self.get_result_future_ = goal_handle.get_result_async()
         self.get_result_future_.add_done_callback(
             functools.partial(self.goal_reached_callback, generation=generation))
 
-    def feedback_callback(self, feedback_msg):
-        """Monitor the feedback from the action server"""
+    def feedback_callback(self, feedback_msg, generation):
+        """
+        Log Nav2's distance_remaining feedback, if requested. Progress-stall detection
+        (see GOAL_PROGRESS_STALL_S) is tracked separately in main_loop's watchdog, from the
+        robot's own pose rather than this feedback - see goal_target_x_'s comment for why.
+        """
 
-        feedback = feedback_msg.feedback
+        if generation != self.goal_generation_:
+            return  # stale: we've since given up on this goal (see GOAL_TIMEOUT_S) and moved on
 
-        self.get_logger().info(f'{feedback.distance_remaining:.2f} m remaining')
+        if self.get_parameter('print_feedback').value:
+            self.get_logger().info(f'{feedback_msg.feedback.distance_remaining:.2f} m remaining')
 
     def goal_reached_callback(self, future, generation):
         """The requested goal has finished (successfully or not)"""
@@ -1216,10 +1701,8 @@ class CaveExplorer(Node):
 
         status = future.result().status
         self.last_goal_succeeded_ = (status == GoalStatus.STATUS_SUCCEEDED)
-        if self.last_goal_succeeded_:
-            self.get_logger().info('  <- reached')
-        else:
-            self.get_logger().info(f'  <- failed (status={status})')
+        self.log_goal_outcome('reached' if self.last_goal_succeeded_ else f'failed (status={status})')
+        self.current_goal_handle_ = None
         self.ready_for_next_goal_ = True
 
 
@@ -1244,14 +1727,32 @@ class CaveExplorer(Node):
         self.planner_go_to_pose2d(goal_pose2d)
 
     def planner_return_home(self):
-        """Return to the origin"""
+        """
+        Return to the origin.
+
+        Uses a distance-scaled timeout (see RETURN_HOME_MIN_SPEED_MPS) instead of the flat
+        GOAL_TIMEOUT_S: RETURN_HOME only happens once, right at the very end, after there's no
+        more exploration time left to protect, so there's no benefit to a short ceiling - only
+        the cost of cutting off a genuinely slow-but-progressing trip home. Live testing hit
+        exactly this: a ~31m trip home abandoned by the flat 45s ceiling with the robot still
+        16m short, after RETURN_HOME had already been exempted from the faster progress-stall
+        check for the same underlying reason (see that check's comment in main_loop).
+        """
 
         goal_pose2d = Pose2D(
             x = 0.0,
             y = 0.0,
             theta = math.pi
         )
-        self.planner_go_to_pose2d(goal_pose2d)
+
+        robot_pose = self.get_pose_2d()
+        if robot_pose is not None:
+            distance_home_m = math.hypot(robot_pose.x, robot_pose.y)
+            timeout_s = max(GOAL_TIMEOUT_S, distance_home_m / RETURN_HOME_MIN_SPEED_MPS)
+        else:
+            timeout_s = GOAL_TIMEOUT_S
+
+        self.planner_go_to_pose2d(goal_pose2d, timeout_s=timeout_s)
 
     def planner_random_walk(self):
         """
@@ -1281,7 +1782,7 @@ class CaveExplorer(Node):
         if not candidates:
             # No navigable point found (e.g. map not built yet) - hold position rather than
             # risk another long Nav2 failure/recovery cycle on an unreachable random point
-            self.get_logger().warn('No navigable random point found - holding position')
+            self.get_logger().warn('    (no navigable random point found - holding position)')
             if robot_pose is not None:
                 self.planner_go_to_pose2d(robot_pose)
             return
@@ -1339,9 +1840,20 @@ class CaveExplorer(Node):
         See https://docs.nav2.org/concepts/index.html
         """
 
+        # Wait for the GUI's "Start Exploring" button (or a manual
+        # `ros2 service call /start_mission std_srvs/srv/Trigger {}`) - see mission_started_'s
+        # comment in __init__.
+        if not self.mission_started_:
+            return
+
         # Mission already wrapped up (cave fully explored, every known artefact visited or
         # abandoned, robot back at base) - nothing further to do.
         if self.mission_complete_:
+            return
+
+        # Paused from the GUI - see pause_mission_callback() for what's already been done to
+        # actually stop the robot; here we just stop making any further decisions until resumed.
+        if self.mission_paused_:
             return
 
         # Don't do anything until SLAM is launched
@@ -1352,6 +1864,27 @@ class CaveExplorer(Node):
             self.get_logger().warn('Waiting for transform... Have you launched a SLAM node?')
             return
 
+        # Planning 3 robustness: treat RETURN_HOME as pre-emptible, not a final committed
+        # state - if an artefact gets confirmed while already heading home (e.g. spotted in
+        # passing), divert to inspect it immediately instead of sailing past and leaving it
+        # stranded as a permanent "pending" count. Checked every tick while a RETURN_HOME goal
+        # is in flight; sending the new inspection goal below naturally preempts whatever Nav2
+        # is still doing with the return-home goal.
+        if self.planner_type_ == PlannerType.RETURN_HOME and not self.ready_for_next_goal_:
+            preempting_target = self.find_inspection_target()
+            if preempting_target is not None:
+                self.get_logger().info(
+                    f"    DIVERT: '{preempting_target['label']}' #{preempting_target['id']} "
+                    f"spotted en route")
+                self.abandon_current_goal('preempted')
+                self.inspection_target_ = preempting_target
+                self.inspection_attempts_ = 0
+                self.planner_type_ = PlannerType.INSPECT_ARTIFACT
+                self.publish_visited_artifact_markers()
+                self.log_episode_start(self.planner_type_.name)
+                self.planner_inspect_artifact()
+                return
+
         #######################################################
         # Update flags related to the progress of the current planner
 
@@ -1359,14 +1892,40 @@ class CaveExplorer(Node):
         # (e.g. repeated "Failed to make progress") for a very long time without ever reporting
         # back. If the current goal has been outstanding too long, give up on it ourselves
         # rather than waiting forever - the next goal we send will naturally preempt whatever
-        # Nav2 is still doing with this one.
+        # Nav2 is still doing with this one. Two triggers: a flat ceiling (GOAL_TIMEOUT_S), and
+        # a progress-based one (GOAL_PROGRESS_STALL_S) based on the robot's own straight-line
+        # distance to the goal - see goal_target_x_'s comment for why that, and not Nav2's
+        # distance_remaining feedback, is what's tracked.
+        #
+        # The progress-based trigger is skipped for RETURN_HOME specifically: live testing hit
+        # it firing twice in a row on the final return trip, genuinely stranding the robot ~14m
+        # short of base once goal cancellation actually started working (see
+        # abandon_current_goal()). RETURN_HOME only happens once, right at the very end, after
+        # there's no more exploration time left to protect - there's no speed benefit to
+        # abandoning it early, only the cost of a stranded robot and a wrongly-declared "didn't
+        # quite reach base". The flat ceiling (self.goal_timeout_s_, normally GOAL_TIMEOUT_S)
+        # still applies so it can't hang forever - but RETURN_HOME sends a distance-scaled one
+        # instead of the flat 45s (see planner_return_home()), after the same flat ceiling was
+        # live-tested hitting a genuinely long ~31m trip home and stranding the robot ~16m short.
         if not self.ready_for_next_goal_ and self.goal_sent_time_ is not None:
-            elapsed_s = (self.get_clock().now() - self.goal_sent_time_).nanoseconds / 1e9
-            if elapsed_s > GOAL_TIMEOUT_S:
-                self.get_logger().info(f'[GOAL]   <- timed out after {elapsed_s:.0f}s, abandoning')
-                self.last_goal_succeeded_ = False
-                self.ready_for_next_goal_ = True
-                self.goal_sent_time_ = None
+            now = self.get_clock().now()
+            elapsed_s = (now - self.goal_sent_time_).nanoseconds / 1e9
+
+            robot_pose = self.get_pose_2d()
+            if robot_pose is not None and self.goal_target_x_ is not None:
+                distance_to_goal = math.hypot(self.goal_target_x_ - robot_pose.x,
+                                               self.goal_target_y_ - robot_pose.y)
+                if self.goal_progress_distance_ is None \
+                        or distance_to_goal < self.goal_progress_distance_ - GOAL_PROGRESS_EPSILON_M:
+                    self.goal_progress_distance_ = distance_to_goal
+                    self.goal_progress_time_ = now
+
+            stalled_s = (now - self.goal_progress_time_).nanoseconds / 1e9 \
+                if self.goal_progress_time_ is not None else 0.0
+            if elapsed_s > self.goal_timeout_s_:
+                self.abandon_current_goal('timed out')
+            elif self.planner_type_ != PlannerType.RETURN_HOME and stalled_s > GOAL_PROGRESS_STALL_S:
+                self.abandon_current_goal('no progress')
 
         # Check if previous goal still running
         if not self.ready_for_next_goal_:
@@ -1389,8 +1948,8 @@ class CaveExplorer(Node):
             # The previous tick's approach goal (for self.inspection_target_) just finished
             if self.last_goal_succeeded_:
                 self.get_logger().info(
-                    f"Inspected '{self.inspection_target_['label']}' "
-                    f"(id={self.inspection_target_['id']})")
+                    f"    DONE: {self.inspection_target_['label']} "
+                    f"#{self.inspection_target_['id']} inspected")
                 self.visited_artifact_ids_.add(self.inspection_target_['id'])
                 self.inspection_target_ = None
                 self.inspection_attempts_ = 0
@@ -1398,24 +1957,36 @@ class CaveExplorer(Node):
                 self.inspection_attempts_ += 1
                 if self.inspection_attempts_ > INSPECTION_MAX_RETRIES:
                     self.get_logger().warn(
-                        f"Abandoning '{self.inspection_target_['label']}' "
-                        f"(id={self.inspection_target_['id']}) after "
+                        f"    DONE: {self.inspection_target_['label']} "
+                        f"#{self.inspection_target_['id']} abandoned after "
                         f"{self.inspection_attempts_} failed attempt(s)")
                     self.abandoned_artifact_ids_.add(self.inspection_target_['id'])
                     self.inspection_target_ = None
                     self.inspection_attempts_ = 0
                 # else: inspection_target_ stays set, so it's retried below
         elif self.planner_type_ == PlannerType.RETURN_HOME:
-            # The final "go home" goal just finished (either way) - mission over, don't fall
-            # through to picking another goal below
-            elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
-            outcome = 'reached base' if self.last_goal_succeeded_ else "didn't quite reach base"
-            self.get_logger().info(
-                f'[MISSION COMPLETE] {outcome} after {elapsed_s:.0f}s - '
-                f'{len(self.visited_artifact_ids_)} artefact(s) inspected, '
-                f'{len(self.abandoned_artifact_ids_)} abandoned')
-            self.mission_complete_ = True
-            return
+            # The "go home" goal just finished (either way) - re-check for any artefact
+            # confirmed too late to trigger the en-route preemption above (e.g. confirmed in
+            # the last tick before arrival) before actually declaring the mission over, rather
+            # than leaving it stranded as a permanent "pending" count.
+            pending_target = self.find_inspection_target()
+            if pending_target is not None:
+                self.get_logger().info(
+                    f"    DIVERT: arrived home, but {pending_target['label']} "
+                    f"#{pending_target['id']} is still pending - resuming inspection")
+                self.inspection_target_ = pending_target
+                self.inspection_attempts_ = 0
+            else:
+                elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
+                outcome = 'reached base' if self.last_goal_succeeded_ else "didn't quite reach base"
+                mission_avg_speed = self.total_distance_m_ / elapsed_s if elapsed_s > 0 else 0.0
+                self.get_logger().info(
+                    f'    MISSION COMPLETE: {outcome} - '
+                    f'{len(self.visited_artifact_ids_)} inspected, '
+                    f'{len(self.abandoned_artifact_ids_)} abandoned, '
+                    f'{elapsed_s:.0f}s total, avg {mission_avg_speed:.2f} m/s')
+                self.mission_complete_ = True
+                return
 
         self.publish_visited_artifact_markers()
 
@@ -1434,7 +2005,7 @@ class CaveExplorer(Node):
         #######################################################
         # Execute the planner by calling the relevant method
         # Add your own planners here!
-        self.get_logger().info(f'[GOAL] {self.planner_type_.name}')
+        self.log_episode_start(self.planner_type_.name)
         if self.planner_type_ == PlannerType.MOVE_FORWARDS:
             self.planner_move_forwards(10)
         elif self.planner_type_ == PlannerType.GO_TO_FIRST_ARTIFACT:
@@ -1457,17 +2028,92 @@ class CaveExplorer(Node):
         #######################################################
 
     def log_status(self):
-        """Periodic [STATUS] heartbeat: elapsed time, current mode, and progress counts"""
+        """Periodic STATUS heartbeat: elapsed time, current mode, and progress counts"""
+
+        if not self.mission_started_:
+            return
 
         elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
-        inspectable = [c for c in self.artifact_clusters_ if c['label'] in INSPECTION_ARTIFACT_LABELS]
+        inspectable = [c for c in self.artifact_clusters_
+                       if c['label'] in INSPECTION_ARTIFACT_LABELS
+                       and c['num_observations'] >= ARTIFACT_CONFIRMATION_OBSERVATIONS]
         visited = len(self.visited_artifact_ids_)
         abandoned = len(self.abandoned_artifact_ids_)
         pending = len(inspectable) - visited - abandoned
 
         self.get_logger().info(
-            f'[STATUS] t={elapsed_s:.0f}s | mode={self.planner_type_.name} | '
-            f'artefacts: visited={visited} abandoned={abandoned} pending={pending}')
+            f'STATUS   t={elapsed_s:.0f}s   mode={self.planner_type_.name}   '
+            f'visited={visited}   abandoned={abandoned}   pending={pending}')
+
+    def publish_gui_status(self):
+        """
+        GUI data feed: publish mission status + the full confirmed-artefact inventory as one
+        JSON payload - see gui_status_pub_'s comment for why this topic exists and why it's a
+        plain JSON string rather than a custom message type.
+        """
+
+        if not self.mission_started_:
+            payload = {'mission_started': False, 'mission_paused': False, 'mission_complete': False,
+                       'mode': 'WAITING', 'elapsed_s': 0.0, 'visited': 0, 'abandoned': 0, 'pending': 0,
+                       'avg_speed_mps': 0.0, 'artifacts': [], 'robot_x': None, 'robot_y': None,
+                       'goal_x': None, 'goal_y': None, 'xlim': None, 'ylim': None}
+            self.gui_status_pub_.publish(String(data=json.dumps(payload)))
+            return
+
+        elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
+        avg_speed_mps = self.total_distance_m_ / elapsed_s if elapsed_s > 0 else 0.0
+
+        # For the GUI's mini-map - see gui.py's MapWidget.
+        robot_pose = self.get_pose_2d()
+        robot_x = round(robot_pose.x, 2) if robot_pose is not None else None
+        robot_y = round(robot_pose.y, 2) if robot_pose is not None else None
+
+        artifacts = []
+        for cluster in self.artifact_clusters_:
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue  # not yet confirmed - see ARTIFACT_CONFIRMATION_OBSERVATIONS
+            if cluster['label'] not in INSPECTION_ARTIFACT_LABELS:
+                status = 'detected'
+            elif cluster['id'] in self.visited_artifact_ids_:
+                status = 'visited'
+            elif cluster['id'] in self.abandoned_artifact_ids_:
+                status = 'abandoned'
+            else:
+                status = 'pending'
+            artifacts.append({
+                'id': cluster['id'],
+                'label': cluster['label'],
+                'x': round(cluster['position'].x, 2),
+                'y': round(cluster['position'].y, 2),
+                'status': status,
+            })
+
+        inspectable = [c for c in self.artifact_clusters_
+                       if c['label'] in INSPECTION_ARTIFACT_LABELS
+                       and c['num_observations'] >= ARTIFACT_CONFIRMATION_OBSERVATIONS]
+        visited = len(self.visited_artifact_ids_)
+        abandoned = len(self.abandoned_artifact_ids_)
+        pending = len(inspectable) - visited - abandoned
+
+        payload = {
+            'mission_started': True,
+            'mission_paused': self.mission_paused_,
+            'mission_complete': self.mission_complete_,
+            'mode': self.planner_type_.name,
+            'elapsed_s': round(elapsed_s, 1),
+            'visited': visited,
+            'abandoned': abandoned,
+            'pending': pending,
+            'avg_speed_mps': round(avg_speed_mps, 2),
+            'artifacts': artifacts,
+            'robot_x': robot_x,
+            'robot_y': robot_y,
+            'goal_x': round(self.goal_target_x_, 2) if self.goal_target_x_ is not None else None,
+            'goal_y': round(self.goal_target_y_, 2) if self.goal_target_y_ is not None else None,
+            'xlim': list(self.xlim_),
+            'ylim': list(self.ylim_),
+        }
+        self.gui_status_pub_.publish(String(data=json.dumps(payload)))
 
 def main():
     # Initialise
