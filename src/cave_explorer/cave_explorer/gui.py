@@ -376,6 +376,40 @@ class MainWindow(QtWidgets.QWidget):
         if self._manual_control_enabled:
             self.ros_node.publish_manual_twist()
 
+    def _update_coverage_label(self, coverage):
+        """
+        Planning 1: show how much reachable cave is still unseen, and how close that is to
+        ending exploration.
+
+        Phrased as "unseen" rather than "unknown" on purpose. Total unknown area is not a
+        meaningful progress bar - the grid is unknown forever in every direction outside the
+        cave - so the number that matters, and the one the node decides on, is unknown space
+        the robot can still reach. See update_exploration_coverage() in cave_explorer.py.
+        """
+
+        if coverage is None:
+            self.coverage_label.setText('waiting for map')
+            return
+
+        if coverage['complete']:
+            self.coverage_label.setText(
+                f"{coverage['mapped_area_m2']:.0f} m² mapped - fully explored")
+            return
+
+        held = coverage['settled_for_s']
+        window = coverage['settle_window_s']
+        if coverage['unseen_frontier_cells'] > coverage['residual_threshold_cells']:
+            # Still genuinely exploring: lead with what is left to see.
+            progress = f"{coverage['unseen_frontier_area_m2']:.0f} m² unseen"
+        else:
+            # Under the residual threshold, now serving out the settle window. Showing the
+            # countdown is the point: this is the state the old streak test skipped straight
+            # past, and seeing it tick is how you know the tour won't start prematurely.
+            progress = f"settling {held:.0f}/{window:.0f}s"
+
+        self.coverage_label.setText(
+            f"{coverage['mapped_area_m2']:.0f} m² mapped, {progress}")
+
     def _update_manual_control_enabled(self, status):
         # Safe whenever main_loop() isn't actively driving: before start, while paused, or
         # once the mission has genuinely finished (at which point the Pause button is itself
@@ -451,10 +485,15 @@ class MainWindow(QtWidgets.QWidget):
         self.elapsed_label = self._value_label('0s')
         self.counts_label = self._value_label('visited=0  abandoned=0  pending=0')
         self.speed_label = self._value_label('0.00 m/s')
+        # Planning 1: the measurement that decides when exploration ends and the science tour
+        # begins. Shown live because that transition used to happen with no visible reason -
+        # see gui_coverage_summary() in cave_explorer.py.
+        self.coverage_label = self._value_label('waiting for map')
         status_layout.addRow('Mode:', self.mode_label)
         status_layout.addRow('Elapsed:', self.elapsed_label)
         status_layout.addRow('Artefacts:', self.counts_label)
         status_layout.addRow('Avg speed:', self.speed_label)
+        status_layout.addRow('Map:', self.coverage_label)
         status_box.setLayout(status_layout)
         column.addWidget(status_box)
 
@@ -643,6 +682,29 @@ class MainWindow(QtWidgets.QWidget):
             f"Abandoned:   {status['abandoned']}",
             f"Pending:     {status['pending']}",
             f"Avg speed:   {status['avg_speed_mps']:.2f} m/s",
+        ]
+
+        # Planning 1: the exploration-completeness measurement. In the summary because "the
+        # cave was fully explored" is otherwise an unevidenced claim, and because the figure
+        # it turns on - reachable unknown space, not total unknown space - is the part worth
+        # being explicit about. See update_exploration_coverage() in cave_explorer.py.
+        coverage = status.get('coverage')
+        if coverage is not None:
+            lines += [
+                '',
+                'Map Coverage (Planning 1):',
+                f"  Mapped:      {coverage['mapped_area_m2']:.1f} m^2 reachable free space",
+                f"  Unseen:      {coverage['unseen_frontier_cells']} reachable frontier cell(s)"
+                f" = {coverage['unseen_frontier_area_m2']:.1f} m^2"
+                f"  (threshold {coverage['residual_threshold_cells']})",
+                f"  Map growth:  {coverage['growth_cells']} new cell(s) over the settle window"
+                f"  (threshold {coverage['growth_threshold_cells']})",
+                f"  Settled for: {coverage['settled_for_s']:.0f}s"
+                f" of {coverage['settle_window_s']:.0f}s required",
+                f"  Complete:    {'yes' if coverage['complete'] else 'no'}",
+            ]
+
+        lines += [
             '',
             'Artefact Inventory:',
         ]
@@ -694,6 +756,7 @@ class MainWindow(QtWidgets.QWidget):
             f"visited={status['visited']}  abandoned={status['abandoned']}  "
             f"pending={status['pending']}")
         self.speed_label.setText(f"{status['avg_speed_mps']:.2f} m/s")
+        self._update_coverage_label(status.get('coverage'))
         self.map_widget.update_data(
             status, self.ros_node.latest_map_image, self.ros_node.map_resolution,
             self.ros_node.map_origin_x, self.ros_node.map_origin_y)

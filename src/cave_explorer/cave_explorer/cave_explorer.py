@@ -100,6 +100,48 @@ def dilate8_mask(mask):
     return out
 
 
+def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolution_m):
+    """
+    Planning 1: measure how much of the *reachable* cave is still unseen.
+
+    The headline figure is 'reachable_frontier_cells': free cells that border unknown space and
+    that the robot can still physically get to, which is the only honest way to ask "is the map
+    finished". Counting unknown cells directly would never converge, because the grid's unknown
+    region continues forever beyond the cave walls; counting frontier cells without the
+    reachability test wouldn't either, because noise pockets sealed behind rock keep a few
+    frontier cells alive permanently. Requiring a path through known free space discards both.
+
+    Deliberately a pure function of the three arrays, with no reference to the node, so the
+    completeness arithmetic can be tested against hand-built grids rather than only in
+    simulation. The caller passes arrays it has already computed for frontier selection, so
+    this adds no BFS of its own - see choose_frontier_goal(), which is the hot path.
+
+    Note that 'frontier_mask' is expected to be the raw output of find_frontier_cells(), before
+    the cluster-size and revisit filters that choose_frontier_goal() applies when picking a
+    goal. Those filters exist to make goal selection sensible, not to describe the map, and
+    mistaking them for a description of the map is exactly how the old completeness test went
+    wrong - see update_exploration_coverage().
+    """
+
+    known = grid >= 0
+    free = known & (grid < FRONTIER_OCCUPIED_THRESHOLD)
+    reachable = path_distance_grid >= 0
+    reachable_free = free & reachable
+    reachable_frontier = frontier_mask & reachable
+    cell_area_m2 = resolution_m * resolution_m
+
+    reachable_frontier_cells = int(np.count_nonzero(reachable_frontier))
+    reachable_free_cells = int(np.count_nonzero(reachable_free))
+
+    return {
+        'known_cells': int(np.count_nonzero(known)),
+        'reachable_free_cells': reachable_free_cells,
+        'reachable_frontier_cells': reachable_frontier_cells,
+        'mapped_area_m2': reachable_free_cells * cell_area_m2,
+        'unseen_frontier_area_m2': reachable_frontier_cells * cell_area_m2,
+    }
+
+
 def pose2d_to_pose(pose_2d):
     """Convert a Pose2D to a full 3D Pose"""
     pose = Pose()
@@ -484,9 +526,50 @@ FRONTIER_REVISIT_RADIUS_M = 4.0
 FRONTIER_REVISIT_WINDOW_S = 180.0
 
 # Planning 1: after this many consecutive checks with a real map available but no frontier
-# candidates found, treat exploration as complete (rather than a one-off gap) and say so
-# clearly in the logs - distinct from the same "no candidates" result before the map exists.
-EXPLORATION_COMPLETE_STREAK = 5
+# candidates found, start saying so in the logs rather than repeating the per-tick line -
+# distinct from the same "no candidates" result before the map exists.
+#
+# This used to be the exploration-completeness test as well, and it was not a sound one. See
+# measure_exploration_coverage() and update_exploration_coverage() for what replaced it and
+# why: "choose_frontier_goal() came back empty" conflates four different situations, only two
+# of which mean the cave is mapped.
+NO_FRONTIER_LOG_STREAK = 5
+
+# Planning 1: exploration-completeness criteria.
+#
+# "Fully explored" cannot mean "no unknown cells left in the grid". The unknown region extends
+# forever outwards past the cave walls, so that figure never reaches zero and never can. What
+# it can mean - and what the rover actually cares about - is that no unknown space is still
+# *reachable*: every free cell the robot can drive to has been seen from, and all the unknown
+# that remains is on the far side of a wall.
+#
+# That is what this threshold measures: how many reachable frontier cells (free cells touching
+# unknown, with a path to the robot through known free space) may still be outstanding before
+# the map counts as finished. Not 0, because a handful of cells persist indefinitely: the lidar
+# is a single horizontal ray at z = 1.0 m, so it grazes past rock edges and leaves one- and
+# two-cell notches behind them that cannot be filled in from any approach angle. 40 cells at
+# 0.3 m resolution is 3.6 m^2 spread over the entire map - about one robot footprint's worth.
+EXPLORATION_RESIDUAL_FRONTIER_CELLS = 40
+
+# Planning 1: the map must also have stopped growing. This is the backstop for the frontier
+# count being wrong for a reason we haven't thought of - if SLAM is still revealing new cells
+# then exploration is self-evidently not finished, whatever the frontier arithmetic says.
+# Measured as newly-known cells (free or occupied) added over EXPLORATION_SETTLE_WINDOW_S;
+# 300 cells is 27 m^2, comfortably less than one of this cave's chambers.
+EXPLORATION_MAP_GROWTH_CELLS = 300
+
+# Planning 1: how long (seconds) both conditions above must hold continuously before
+# exploration is declared complete.
+#
+# Deliberately longer than FRONTIER_REVISIT_WINDOW_S (180s), and that is the whole point. The
+# old streak-of-5 test could be satisfied entirely *inside* the revisit window: that filter
+# suppresses every candidate frontier within FRONTIER_REVISIT_RADIUS_M of a recently-sent
+# goal, so a robot working its way along a corridor can legitimately see "no candidates" five
+# ticks running while real unexplored cave sits 5 m away, suppressed and invisible. Live run 5
+# did exactly this - the streak reached 3 of 5 while the widest chamber in the map was still
+# growing from 6.4 m to 11.9 m. Spanning the window guarantees those suppressions have expired
+# and the frontiers behind them have had their chance to reappear and reset the clock.
+EXPLORATION_SETTLE_WINDOW_S = 200.0
 
 # Planning 2: artefact types the robot will pause exploration to inspect up close. Chosen as
 # the 3 most visually distinct profiles in ARTIFACT_COLOR_PROFILES (per that list's own
@@ -721,13 +804,25 @@ class CaveExplorer(Node):
         # FRONTIER_REVISIT_WINDOW_S - see that constant's comment above.
         self.recent_frontier_goals_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
-        # Planning 1: consecutive ticks with a real map but no frontier candidates - see
-        # EXPLORATION_COMPLETE_STREAK and planner_explore_frontier().
+        # Planning 1: consecutive ticks with a real map but no frontier candidates. Log
+        # verbosity only - see NO_FRONTIER_LOG_STREAK, and update_exploration_coverage() for
+        # why this no longer decides whether exploration is finished.
         self.no_frontier_streak_ = 0
         # Set once the cave is fully mapped (sticky - never reset back to False). Once true
         # and every known artefact is visited/abandoned, main_loop sends the robot home
         # instead of continuing to explore - see the mission-complete handling there.
         self.exploration_complete_ = False
+        # Planning 1: the latest measure_exploration_coverage() result, or None before the
+        # first map arrives. Drives the completeness decision, and is also reported to the GUI
+        # so "the map is fully explored" is a number the operator can see rather than a claim.
+        self.coverage_ = None
+        # (time, known_cells) samples spanning EXPLORATION_SETTLE_WINDOW_S, for the
+        # has-the-map-stopped-growing half of the completeness test.
+        self.known_cell_history_ = deque()
+        # When the reachable-frontier count first dropped to the residual level and stayed
+        # there, or None if it currently hasn't. Exploration completes once this has held for
+        # EXPLORATION_SETTLE_WINDOW_S; any reachable frontier reappearing resets it to None.
+        self.residual_clear_since_ = None
         # Set once the robot has returned home after exploration_complete_ and no artefacts
         # remain pending - main_loop stops doing anything further once this is true.
         self.mission_complete_ = False
@@ -1706,6 +1801,14 @@ class CaveExplorer(Node):
         robot_row, robot_col = self.world_to_grid(robot_pose.x, robot_pose.y)
         path_distance_grid = self.compute_path_distance_grid(robot_row, robot_col)
 
+        # Planning 1: assess map completeness here, using the unfiltered frontier mask and the
+        # BFS we have just computed for goal selection, so the check costs nothing extra on
+        # this hot path. It has to read the mask *before* the cluster-size and revisit filters
+        # below, which describe what is worth driving to rather than what is still unseen -
+        # see update_exploration_coverage() for why conflating those two broke exploration.
+        self.update_exploration_coverage(measure_exploration_coverage(
+            self.map_grid_, frontier_mask, path_distance_grid, self.map_resolution_))
+
         # Drop goals older than the revisit window - see FRONTIER_REVISIT_WINDOW_S's comment
         now = self.get_clock().now()
         self.recent_frontier_goals_ = [
@@ -1764,6 +1867,106 @@ class CaveExplorer(Node):
 
         chosen = max(reachable_candidates, key=lambda c: c['score'])
         return chosen, candidates
+
+    def update_exploration_coverage(self, counts):
+        """
+        Planning 1: fold a fresh coverage measurement into the exploration-completeness
+        decision, and latch exploration_complete_ once the cave really is mapped.
+
+        This replaces a test that watched choose_frontier_goal() return None for five ticks in
+        a row (the old EXPLORATION_COMPLETE_STREAK, which survives as NO_FRONTIER_LOG_STREAK
+        with no authority over anything but log verbosity). That test was unsound, because an
+        empty result conflates four different situations:
+
+          1. no frontier cells at all                      -> exploration really is finished
+          2. only sub-FRONTIER_MIN_CLUSTER_SIZE noise left  -> effectively finished
+          3. every real frontier suppressed by the revisit window -> NOT finished, just busy
+          4. frontiers the BFS can't reach from here yet    -> NOT finished, ambiguous
+
+        Only the first two mean anything is over. The streak counted all four alike, and once
+        it fired it set exploration_complete_ permanently, with nothing able to clear it. So a
+        transient 180-second revisit suppression - case 3, a completely normal thing to happen
+        while working a corridor - could end exploration for the rest of the mission and send
+        the robot off on its science tour with half the cave still unknown. That is the
+        behaviour reported from the demo runs, and run 5's log shows the mechanism directly:
+        the streak reached 3 of its 5 while the widest chamber was still growing 6.4m -> 11.9m.
+
+        The replacement asks the two questions that actually matter, and requires both to hold
+        continuously for EXPLORATION_SETTLE_WINDOW_S:
+
+          - is any unknown space still reachable?  (EXPLORATION_RESIDUAL_FRONTIER_CELLS)
+          - is the map still growing?              (EXPLORATION_MAP_GROWTH_CELLS)
+
+        The second is a backstop for the first being wrong: whatever the frontier arithmetic
+        says, if SLAM is still revealing cells then exploration is not finished. Measuring the
+        raw map that way also means the test doesn't care how goal selection is tuned, so
+        changing FRONTIER_MIN_CLUSTER_SIZE or the revisit window can no longer move the
+        finish line by accident.
+        """
+
+        now = self.get_clock().now()
+        self.coverage_ = dict(counts)
+        self.known_cell_history_.append((now, counts['known_cells']))
+
+        # Keep the oldest sample that is still at least a full window old, so growth is always
+        # measured over >= EXPLORATION_SETTLE_WINDOW_S rather than over however many samples
+        # happen to be buffered. Checking [1] rather than [0] is what preserves that sample:
+        # we only drop the front once the one behind it is itself old enough to replace it.
+        while len(self.known_cell_history_) > 2 and \
+                (now - self.known_cell_history_[1][0]).nanoseconds / 1e9 >= EXPLORATION_SETTLE_WINDOW_S:
+            self.known_cell_history_.popleft()
+
+        oldest_time, oldest_known = self.known_cell_history_[0]
+        history_span_s = (now - oldest_time).nanoseconds / 1e9
+        growth_cells = counts['known_cells'] - oldest_known
+
+        # compute_path_distance_grid() gives up and returns an all -1 grid when the robot's own
+        # cell doesn't read as free, which SLAM does transiently (a pose jump after a loop
+        # closure, a scan that paints the robot's own footprint). Nothing is then reachable, so
+        # the frontier count is 0 and the residual test would pass for the most dangerous
+        # possible reason: exploration "complete" with nothing mapped at all. Reachable free
+        # space being empty is unambiguous - the robot cannot reach the cell it is standing on -
+        # so treat the whole measurement as unusable rather than as evidence of anything.
+        measurement_valid = counts['reachable_free_cells'] > 0
+
+        residual_clear = measurement_valid and \
+            counts['reachable_frontier_cells'] <= EXPLORATION_RESIDUAL_FRONTIER_CELLS
+        map_settled = growth_cells <= EXPLORATION_MAP_GROWTH_CELLS
+
+        if residual_clear:
+            if self.residual_clear_since_ is None:
+                self.residual_clear_since_ = now
+        else:
+            # A reachable frontier came back, so whatever we thought was residual wasn't.
+            # Restart the clock from zero rather than letting earlier quiet ticks count.
+            self.residual_clear_since_ = None
+
+        held_s = 0.0 if self.residual_clear_since_ is None else \
+            (now - self.residual_clear_since_).nanoseconds / 1e9
+
+        self.coverage_['growth_cells'] = growth_cells
+        self.coverage_['residual_clear'] = residual_clear
+        self.coverage_['map_settled'] = map_settled
+        self.coverage_['held_s'] = held_s
+
+        if self.exploration_complete_:
+            return
+
+        # history_span_s is checked as well as held_s because the two can disagree on a run
+        # where main_loop ticked sparsely: held_s only says the frontier count has been low
+        # since some wall-clock instant, while history_span_s says we actually have a
+        # measurement old enough to compare the map size against.
+        if residual_clear and map_settled \
+                and held_s >= EXPLORATION_SETTLE_WINDOW_S \
+                and history_span_s >= EXPLORATION_SETTLE_WINDOW_S:
+            self.exploration_complete_ = True
+            self.get_logger().info(
+                f"    EXPLORATION COMPLETE: no reachable unknown space left - "
+                f"{counts['reachable_frontier_cells']} residual frontier cell(s) "
+                f"(<= {EXPLORATION_RESIDUAL_FRONTIER_CELLS}) held for {held_s:.0f}s, "
+                f"map grew {growth_cells} cell(s) in that time "
+                f"(<= {EXPLORATION_MAP_GROWTH_CELLS}); "
+                f"{counts['mapped_area_m2']:.0f} m^2 mapped and reachable")
 
     def publish_frontier_markers(self, chosen, candidates):
         """Planning 1: visualise every candidate frontier (yellow) and the chosen one (red)"""
@@ -1824,14 +2027,20 @@ class CaveExplorer(Node):
             if self.map_grid_ is None:
                 self.get_logger().info('    (no map yet - taking a random step until SLAM has data)')
             else:
+                # Note what the completeness measurement makes of it, rather than concluding
+                # anything here. Having no *goal* to drive to is a routine, usually temporary
+                # state - most often every real frontier is currently suppressed by the
+                # revisit window - and treating it as proof the cave was mapped is the bug
+                # update_exploration_coverage() exists to fix. Random-walking is still the
+                # right move: it shifts the viewpoint, which is what un-sticks the situation.
                 self.no_frontier_streak_ += 1
-                if self.no_frontier_streak_ >= EXPLORATION_COMPLETE_STREAK:
-                    if not self.exploration_complete_:
-                        self.get_logger().info(
-                            f'    EXPLORATION COMPLETE: no frontiers found for '
-                            f'{self.no_frontier_streak_} consecutive checks - the cave appears '
-                            'to be fully mapped')
-                    self.exploration_complete_ = True
+                unseen = self.coverage_['reachable_frontier_cells'] \
+                    if self.coverage_ is not None else None
+                if self.no_frontier_streak_ >= NO_FRONTIER_LOG_STREAK and unseen:
+                    self.get_logger().info(
+                        f'    (no frontier goal for {self.no_frontier_streak_} checks, but '
+                        f'{unseen} reachable frontier cell(s) remain unseen - taking a random '
+                        f'step to shift the viewpoint)')
                 else:
                     self.get_logger().info('    (no frontiers right now - taking a random step)')
             self.planner_random_walk()
@@ -2988,6 +3197,14 @@ class CaveExplorer(Node):
         Either exploration has finished (the natural trigger - the cave is mapped, so now go
         back round everything worth a second look) or the tour was explicitly requested via the
         start_science_tour service.
+
+        "Exploration has finished" is a stronger claim than it used to be: it now means no
+        unknown space is reachable any more and the map has stopped growing, both held for
+        EXPLORATION_SETTLE_WINDOW_S - see update_exploration_coverage(). It previously meant
+        only that frontier goal selection had come back empty a few ticks running, which could
+        happen with a third of the cave unmapped, and the tour would then set off round a
+        partial map. The service override is unaffected and still starts a tour on demand from
+        whatever has been discovered so far, which is what makes it useful for a short demo.
         """
 
         if self.tour_complete_ or self.tour_planning_failed_:
@@ -3234,11 +3451,13 @@ class CaveExplorer(Node):
                 elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
                 outcome = 'reached base' if self.last_goal_succeeded_ else "didn't quite reach base"
                 mission_avg_speed = self.total_distance_m_ / elapsed_s if elapsed_s > 0 else 0.0
+                mapped = f", {self.coverage_['mapped_area_m2']:.0f} m^2 mapped" \
+                    if self.coverage_ is not None else ''
                 self.get_logger().info(
                     f'    MISSION COMPLETE: {outcome} - '
                     f'{len(self.visited_artifact_ids_)} inspected, '
                     f'{len(self.abandoned_artifact_ids_)} abandoned, '
-                    f'{elapsed_s:.0f}s total, avg {mission_avg_speed:.2f} m/s')
+                    f'{elapsed_s:.0f}s total, avg {mission_avg_speed:.2f} m/s{mapped}')
                 self.mission_complete_ = True
                 return
 
@@ -3320,7 +3539,8 @@ class CaveExplorer(Node):
             payload = {'mission_started': False, 'mission_paused': False, 'mission_complete': False,
                        'mode': 'WAITING', 'elapsed_s': 0.0, 'visited': 0, 'abandoned': 0, 'pending': 0,
                        'avg_speed_mps': 0.0, 'artifacts': [], 'robot_x': None, 'robot_y': None,
-                       'goal_x': None, 'goal_y': None, 'xlim': None, 'ylim': None, 'tour': None}
+                       'goal_x': None, 'goal_y': None, 'xlim': None, 'ylim': None, 'tour': None,
+                       'coverage': None}
             self.gui_status_pub_.publish(String(data=json.dumps(payload)))
             return
 
@@ -3377,8 +3597,36 @@ class CaveExplorer(Node):
             'xlim': list(self.xlim_),
             'ylim': list(self.ylim_),
             'tour': self.gui_tour_summary(),
+            'coverage': self.gui_coverage_summary(),
         }
         self.gui_status_pub_.publish(String(data=json.dumps(payload)))
+
+    def gui_coverage_summary(self):
+        """
+        Planning 1, for the GUI: how much reachable cave has been mapped, how much unknown is
+        still reachable, and how close that is to satisfying the completeness test.
+
+        Worth publishing because "exploration is complete" is the decision that starts the
+        science tour, and when it fired early there was no way to see why from the GUI - the
+        Mode field simply changed to SCIENCE_TOUR. Exposing the two figures the decision is
+        actually made on turns it into something an operator can watch approach the threshold,
+        and something the run summary can state as a measurement rather than a claim.
+        """
+
+        if self.coverage_ is None:
+            return None
+
+        return {
+            'mapped_area_m2': round(self.coverage_['mapped_area_m2'], 1),
+            'unseen_frontier_cells': self.coverage_['reachable_frontier_cells'],
+            'unseen_frontier_area_m2': round(self.coverage_['unseen_frontier_area_m2'], 1),
+            'residual_threshold_cells': EXPLORATION_RESIDUAL_FRONTIER_CELLS,
+            'growth_cells': self.coverage_['growth_cells'],
+            'growth_threshold_cells': EXPLORATION_MAP_GROWTH_CELLS,
+            'settled_for_s': round(self.coverage_['held_s'], 0),
+            'settle_window_s': EXPLORATION_SETTLE_WINDOW_S,
+            'complete': self.exploration_complete_,
+        }
 
     def gui_tour_summary(self):
         """
