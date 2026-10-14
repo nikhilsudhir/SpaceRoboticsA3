@@ -1587,23 +1587,27 @@ class CaveExplorer(Node):
 
     def abandon_current_goal(self, outcome_text='abandoned'):
         """
-        Give up on the in-flight Nav2 goal: cancel it with Nav2 (so it actually stops trying,
-        rather than continuing to execute in the background while we've locally moved on to
-        something else) and bump goal_generation_ (so a late response/result callback for it
-        is recognised as stale and ignored, even on the one path that doesn't immediately send
-        a replacement goal - RETURN_HOME's mission-complete branch, which just returns).
+        Give up on the in-flight Nav2 goal locally - bump goal_generation_ (so a late
+        response/result callback for it is recognised as stale and ignored) and clear the
+        tracking state - WITHOUT explicitly cancelling it with Nav2 first.
 
-        Without this, a goal we'd given up on could still actually succeed with Nav2 minutes
-        later, update last_goal_succeeded_/ready_for_next_goal_ out from under whatever we've
-        since moved on to, and (for the mission-complete case) make the final [MISSION
-        COMPLETE] log wrongly claim "didn't quite reach base" when it actually did, just later
-        than our patience allowed.
+        Every call site of this (the DIVERT preemption, and the timeout/no-progress watchdog
+        in main_loop) sends a brand new goal immediately afterwards, in the same tick. Nav2's
+        bt_navigator already preempts a goal that's still executing the instant a new one is
+        sent to the same action client - that's the standard, intended way Nav2's single-goal
+        action servers switch goals, not a fallback. An earlier version of this method called
+        current_goal_handle_.cancel_goal_async() here first, which raced against that: the
+        very next goal could land in the gap between Nav2 accepting the cancel and the
+        behaviour tree actually finishing its halt, getting instantly aborted by Nav2 itself
+        (logged as a goal "failed" in 0s, status=6) while the BT reset - a visible stutter/
+        stop matching exactly the "randomly pausing" symptom reported live, confirmed by
+        bt_navigator's own "Aborting handle" / "Failed to get result for follow_path in node
+        halt!" messages appearing right at those moments. Letting Nav2's own preemption
+        handle the swap (just by sending the next goal) avoids the race entirely.
         """
 
         self.log_goal_outcome(outcome_text)
-        if self.current_goal_handle_ is not None:
-            self.current_goal_handle_.cancel_goal_async()
-            self.current_goal_handle_ = None
+        self.current_goal_handle_ = None
         self.goal_generation_ += 1
         self.last_goal_succeeded_ = False
         self.ready_for_next_goal_ = True
