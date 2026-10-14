@@ -70,6 +70,15 @@ Optional, only if you want to manually drive the robot (e.g. while collecting th
 sudo apt install ros-humble-teleop-twist-keyboard
 ```
 
+Optional, only needed for the [trained artefact classifier](#trained-artefact-classifier-advanced-1) - without it, `cave_explorer.py` still runs fine, just without that refinement step (a warning is logged once at startup instead):
+
+```bash
+pip install --target ~/.local/share/cave_explorer_tflite tflite-runtime
+pip install --target ~/.local/share/cave_explorer_tflite "numpy<2" --upgrade
+```
+
+Installed into its own dedicated directory rather than a plain `pip install --user` - deliberately, not out of caution for its own sake. Two real problems with `--user` on a typical dev machine: the ROS-sourced shell's `PYTHONPATH` doesn't include the user site-packages directory by default (so the import would silently fail unless every teammate also hand-edits their own `~/.bashrc`), and if your user site-packages already has a different OpenCV version installed from unrelated past work (common on a machine also used for other robotics/ML courses), a plain `--user` install would make Python find *that* `cv2` instead of the ROS one - a working import that silently behaves differently. The dedicated directory sidesteps both: it's added to `sys.path` directly in code, and contains nothing but `tflite_runtime` and the one `numpy` release it needs.
+
 ## Building
 
 You'll need a colcon workspace to build into — if you don't already have one from previous coursework, create one:
@@ -160,6 +169,30 @@ Drive the robot around (random walk/goals, waypoints, or teleop — see Percepti
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
 
+Two helper scripts turn that sorted dataset into something usable for training a model (see [Trained artefact classifier](#trained-artefact-classifier-advanced-1) below):
+
+```bash
+# First-pass auto-sort of raw, unsorted frames into suggested per-label folders (still needs a manual skim/fix afterwards - see each script's own docstring for details)
+ros2 run cave_explorer sort_dataset_images -- --input ~/cave_dataset --output ~/cave_dataset_sorted
+
+# Once you're happy the sorted folders are correct: auto-crop each image down to just the detected artefact, ready to upload to Teachable Machine
+ros2 run cave_explorer build_classifier_dataset -- --input ~/cave_dataset_sorted --output ~/cave_dataset_cropped
+```
+
+### Trained artefact classifier (Advanced 1)
+
+Built on top of Perception 2's HSV detection, not a replacement for it: every HSV-detected box is cropped and re-examined by a small trained image classifier, which can confirm the HSV label, correct it (the dataset-sorting process surfaced real, persistent HSV cross-label confusion - e.g. a distant/partially-lit `green_alien` can produce a torso-coloured blob matching `green_crystals`' profile), or reject it outright if the classifier is confident it's actually background (`negative`) - a false positive HSV never should have matched in the first place. See `CLASSIFIER_*` constants and `refine_detections_with_classifier()` in `cave_explorer.py` for the exact logic.
+
+To build/replace the model:
+
+1. Collect and sort a dataset (see above), then run `build_classifier_dataset` to get cropped, per-label folders.
+2. Upload each folder to [Teachable Machine](https://teachablemachine.withgoogle.com/) as a class named *exactly* the same as the folder (e.g. `green_alien`, not "Green Alien") - the exported labels must match `cave_explorer.py`'s own label strings exactly, or the classifier's predictions won't mean anything to the rest of the code.
+3. Train, then export as **TensorFlow Lite → Floating point → Download my model**.
+4. Unzip it and place the `.tflite` model (renamed `model.tflite`) and `labels.txt` into `src/cave_explorer/config/artifact_classifier/`.
+5. `colcon build --symlink-install --packages-select cave_explorer` (new files need a rebuild to be picked up) and re-source.
+
+This step is optional - if `tflite_runtime` isn't installed (see [Prerequisites](#prerequisites)) or no model is present at that path, `cave_explorer.py` logs a warning once at startup and falls back to HSV-only detection, same as before this feature existed.
+
 ### Autonomous exploration and artefact inspection (Planning 1–3)
 
 Once all three launch files are running, the robot is ready to explore and inspect artefacts fully autonomously — no manual goals needed — but it waits for an explicit start trigger rather than beginning the instant the autonomy node launches. Start it either from the [GUI](#mission-control-gui) ("Start Exploring" button) or directly:
@@ -181,7 +214,7 @@ In RViz:
 - **`frontier_markers`** (Planning 1) — yellow points are candidate exploration frontiers (free cells bordering unknown space, clustered), the red sphere is the one currently chosen. The robot heads there, then re-evaluates once it arrives (or the goal fails).
 - **`artifact_inspection_status_markers`** (Planning 3) — a small flag above each inspectable artefact: **red** = not yet inspected, **green** = successfully inspected, **orange** = abandoned after repeated failed approach attempts.
 
-Only `blue_cube`, `white_sphere`, and `green_crystals` (`INSPECTION_ARTIFACT_LABELS` in `cave_explorer.py`) trigger close-range inspection — these were judged the most visually distinct of Perception 2's colour profiles. When one is detected, the robot pauses exploring, navigates to a standoff viewpoint (`INSPECTION_STANDOFF_DISTANCE_M`, default 2 m) facing it, then resumes exploring. A failed approach is retried once (`INSPECTION_MAX_RETRIES`) before being abandoned.
+Only `mushroom_blue`, `white_sphere`, and `green_crystals` (`INSPECTION_ARTIFACT_LABELS` in `cave_explorer.py`) trigger close-range inspection — these were judged the most visually distinct of Perception 2's colour profiles. When one is detected, the robot pauses exploring, navigates to a standoff viewpoint (`INSPECTION_STANDOFF_DISTANCE_M`, default 2 m) facing it, then resumes exploring. A failed approach is retried once (`INSPECTION_MAX_RETRIES`) before being abandoned.
 
 ### Mission Control GUI
 
