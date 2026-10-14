@@ -1,0 +1,7 @@
+0 green_alien
+1 green_crystals
+2 ice_formation
+3 mushroom_blue
+4 negative
+5 stop_sign
+6 white_sphere

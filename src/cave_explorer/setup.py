@@ -24,8 +24,9 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*launch.[pxy][yma]*')),
-        ('share/' + package_name + '/config', glob('config/*')),
-    ] + generate_data_files('share/' + package_name + '/', 'urdf') + generate_data_files('share/' + package_name + '/', 'worlds'),
+    ] + generate_data_files('share/' + package_name + '/', 'config')
+      + generate_data_files('share/' + package_name + '/', 'urdf')
+      + generate_data_files('share/' + package_name + '/', 'worlds'),
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='Graeme Best',
@@ -36,7 +37,9 @@ setup(
     entry_points={
         'console_scripts': [
             'cave_explorer = cave_explorer.cave_explorer:main',
-            'gui = cave_explorer.gui:main'
+            'gui = cave_explorer.gui:main',
+            'build_classifier_dataset = cave_explorer.build_classifier_dataset:main',
+            'sort_dataset_images = cave_explorer.sort_dataset_images:main'
         ],
     },
 )

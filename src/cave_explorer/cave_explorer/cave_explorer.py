@@ -1,9 +1,38 @@
 #!/usr/bin/env python3
 
+import os
+import sys
+
+# Advanced 1 prep: the trained artefact classifier (see build_classifier_dataset.py and
+# config/artifact_classifier/) is loaded via tflite_runtime rather than full tensorflow - much
+# lighter weight for a ROS node that only needs inference, not training.
+#
+# Installed into its own dedicated directory (see README) rather than the general user
+# site-packages - deliberately NOT just `pip install --user`. Two problems with that: (1) the
+# ROS-sourced shell environment's PYTHONPATH doesn't include the user site-packages directory
+# by default (same gap hit earlier with pypdf), and (2) on this machine the general user
+# site-packages already has an unrelated, much newer opencv-python installed (from prior,
+# unrelated work) - adding that whole directory to sys.path would silently swap this node's
+# cv2 for a different, untested version. A dedicated install directory, containing only
+# tflite_runtime and the specific numpy release it needs, avoids both: it's added to sys.path
+# explicitly here (no bashrc edit needed on any teammate's machine) without exposing anything
+# else that happens to live in the general user site-packages.
+#
+# MUST happen before cv2/numpy are imported below (not just before tflite_runtime) - numpy is a
+# process-wide singleton once imported, so if cv2's own internal numpy import runs first and
+# binds the older system numpy, tflite_runtime's compiled extension (needing a newer numpy ABI)
+# fails even though the right numpy is sitting right here, unused.
+_tflite_install_dir = os.path.expanduser('~/.local/share/cave_explorer_tflite')
+if os.path.isdir(_tflite_install_dir) and _tflite_install_dir not in sys.path:
+    sys.path.insert(0, _tflite_install_dir)
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    tflite = None
+
 import functools
 import json
 import math
-import os
 import random
 from collections import deque, namedtuple
 from enum import Enum
@@ -13,6 +42,7 @@ import numpy as np
 import rclpy
 import tf2_geometry_msgs
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, Pose2D, PoseStamped, Point, PointStamped
 from nav2_msgs.action import NavigateToPose
@@ -287,20 +317,21 @@ Detection = namedtuple('Detection', ['label', 'bbox', 'color_rgb'])
 # Some artefacts (e.g. green_alien vs toy_story_alien, white_sphere vs ice_formation)
 # have deliberately similar colours and may be confused with this simple approach.
 #
-# toy_story_alien and mossy_boulder are deliberately NOT included here: neither is actually
-# placed anywhere in mars_cave.sdf (checked directly against the world file), so every
-# detection that would appear under either label is guaranteed to be a false positive -
-# mostly wall/floor rock texture, and (for toy_story_alien specifically) a major contributor
-# to green_crystals/green_alien getting mislabeled, since its hue/value range overlapped both.
-# Dropping them removes that confusion entirely with zero loss of real detection capability.
+# toy_story_alien, mossy_boulder, AND blue_cube are deliberately NOT included here: none of
+# the three is actually placed anywhere in mars_cave.sdf (checked directly against the world
+# file - it places exactly 15 artifacts, 3 each of only 5 real models: green_alien,
+# green_crystals, white_sphere, ice_formation, mushrooms_blue). blue_cube in particular wasn't
+# just an unused profile sitting idle - its hue range (100-125) happened to match
+# mushrooms_blue's actual rendered colour well, so it was WINNING the cross-label tie-break
+# against mushroom_blue's own profile all session, meaning every "blue_cube" detection/
+# inspection logged throughout development was actually mushrooms_blue under the wrong label
+# (confirmed by eye against saved Perception 1 dataset photos - every "blue_cube" frame shows
+# the mushroom model, never a cube). This is also why mushroom_blue's own profile kept losing
+# ground no matter how it was narrowed - it was being deliberately pushed AWAY from the hue
+# range the real object actually needs, to dodge a competing profile that was never real to
+# begin with. Dropping all three false profiles removes that confusion entirely with zero loss
+# of real detection capability.
 ARTIFACT_COLOR_PROFILES = [
-    {
-        'label': 'blue_cube',
-        'hsv_lower': (100, 120, 60),
-        'hsv_upper': (125, 255, 255),
-        'min_area': 300,
-        'color_rgb': (30, 90, 255),
-    },
     {
         'label': 'green_crystals',
         'hsv_lower': (42, 140, 40),
@@ -331,17 +362,21 @@ ARTIFACT_COLOR_PROFILES = [
     },
     {
         'label': 'mushroom_blue',
-        # Narrowed from (80, 40, 140)-(130, 180, 255): that window was wide enough to fully
-        # contain ice_formation's, white_sphere's, AND blue_cube's hue ranges at once, and
-        # live testing confirmed mushroom_blue winning the cross-label tie-break against all
-        # three in separate runs. First pass (hue floor 115) cleared ice_formation (max 115)
-        # and white_sphere (max 120) but still left a 10-degree overlap with blue_cube
-        # (100-125) - live testing confirmed that's exactly where the mushroom's actual
-        # rendered colour sits, since it kept winning against blue_cube specifically even
-        # after the other two were fixed. Hue floor raised again, past blue_cube's ceiling
-        # (125) entirely this time.
-        'hsv_lower': (128, 90, 150),
-        'hsv_upper': (155, 200, 255),
+        # Empirically resampled from the Perception 1 dataset after the hue-only narrowing
+        # history above (128, then reverted to 115) turned out to still be guesswork - directly
+        # sampling real pixels from confirmed mushroom_blue photos showed its hue (97-121)
+        # almost entirely overlaps BOTH white_sphere's (95-120) and ice_formation's (90-120) -
+        # they're effectively the same hue band in this world, so no hue split alone can
+        # separate them. What actually differs is saturation: mushroom_blue's pixels are far
+        # more vivid (median S ~120-125) than white_sphere/ice_formation's pale, washed-out
+        # look (median S ~49 for both). Sweeping the saturation floor against all three classes'
+        # real sampled images found a clean cliff at S=150: 27/29 mushroom_blue images still
+        # match (recall holds right up to the edge - S=160 drops to 4/29), while white_sphere
+        # false-positives drop to 3/39 and ice_formation/green_crystals/green_alien/stop_sign/
+        # negative all hit zero. Hue range left wide (90-125) since saturation is now doing the
+        # real separating work, not hue.
+        'hsv_lower': (90, 150, 90),
+        'hsv_upper': (125, 255, 255),
         'min_area': 300,
         'color_rgb': (255, 120, 255),
     },
@@ -349,6 +384,36 @@ ARTIFACT_COLOR_PROFILES = [
 
 # Lookup used to colour Perception 3's RViz markers to match each artefact's Perception 2 detection colour
 ARTIFACT_COLOR_BY_LABEL = {profile['label']: profile['color_rgb'] for profile in ARTIFACT_COLOR_PROFILES}
+
+# Advanced 1: trained-classifier refinement of the HSV detections above. The Perception 1
+# dataset's own sorting process (manually verifying hundreds of HSV-detected crops by eye)
+# surfaced real, persistent cross-label confusion in the live detector itself - most notably
+# green_alien/green_crystals (adjacent hue ranges; a distant or partially-lit alien can produce
+# a torso-coloured blob that matches green_crystals' profile, sometimes even a BIGGER matching
+# area than genuine crystal images) and the white_sphere/ice_formation/mushroom_blue group
+# (near-identical pale, low-saturation appearance). A trained classifier - built from that same
+# manually-verified dataset via Teachable Machine (see build_classifier_dataset.py) - is used
+# here to catch exactly those cases: it re-examines each HSV-matched crop and can confirm,
+# correct, or reject (if it predicts 'negative') the HSV label, rather than trusting HSV's
+# first guess outright.
+#
+# Matches the 224x224 RGB input and preprocessing (see classify_crop()) the model was actually
+# trained on by Teachable Machine - must stay in sync with any re-export of the model.
+CLASSIFIER_INPUT_SIZE = 224
+# Crop margin (pixels) around each HSV-detected box before classifying - matches
+# build_classifier_dataset.py's CROP_MARGIN_PX exactly, so the classifier sees the same kind of
+# crop live that it was trained on (a looser/tighter margin here would be a train/inference
+# mismatch, undermining the whole point of training on real detection crops).
+CLASSIFIER_CROP_MARGIN_PX = 15
+# Below this confidence, the classifier's opinion is treated as inconclusive and the original
+# HSV label is kept as-is rather than risking a low-confidence relabel/rejection overriding a
+# perfectly good HSV match.
+CLASSIFIER_CONFIDENCE_THRESHOLD = 0.6
+CLASSIFIER_NEGATIVE_LABEL = 'negative'
+# Perception 2's own cascade classifier for stop signs is already a dedicated, reliable
+# detector (see detect_stop_signs()) - not part of the HSV cross-label confusion this is meant
+# to fix, so stop_sign detections are left untouched rather than re-judged by this classifier.
+CLASSIFIER_SKIP_LABELS = frozenset({'stop_sign'})
 
 # The RGB-D camera's colour and depth images share one sensor (single <camera> block in
 # mars_explorer.gazebo.xacro), so both use the same intrinsics computed from its resolution/FOV.
@@ -427,7 +492,7 @@ EXPLORATION_COMPLETE_STREAK = 5
 # the 3 most visually distinct profiles in ARTIFACT_COLOR_PROFILES (per that list's own
 # comments, e.g. green_alien/toy_story_alien and white_sphere/ice_formation are more likely
 # to be confused with each other, so are left out).
-INSPECTION_ARTIFACT_LABELS = ['blue_cube', 'white_sphere', 'green_crystals']
+INSPECTION_ARTIFACT_LABELS = ['mushroom_blue', 'white_sphere', 'green_crystals']
 
 # Planning 2: distance (metres) to stop from an artefact for close-range inspection.
 INSPECTION_STANDOFF_DISTANCE_M = 2.0
@@ -672,6 +737,7 @@ class CaveExplorer(Node):
         self.image_detections_pub_ = self.create_publisher(Image, 'detections_image', 1)
         self.declare_parameter('computer_vision_model_filename', rclpy.Parameter.Type.STRING)
         self.computer_vision_model_ = cv2.CascadeClassifier(self.get_parameter('computer_vision_model_filename').value)
+        self.classifier_interpreter_, self.classifier_labels_ = self.load_artifact_classifier()
         self.image_sub_ = self.create_subscription(Image, 'camera/image', self.image_callback, 1)
 
         # Perception 3: depth image, used to localise detected artefacts (see localise_artifacts())
@@ -856,6 +922,12 @@ class CaveExplorer(Node):
             self.detect_stop_signs(image) + self.detect_color_artifacts(image),
             priority_labels={'stop_sign'})
 
+        # Advanced 1: re-examine each HSV detection with the trained classifier - confirms,
+        # relabels (fixes cross-label confusion like green_alien/green_crystals), or drops it
+        # entirely (if the classifier is confident it's actually 'negative' - a false positive).
+        # See CLASSIFIER_* constants' comments above for why this exists.
+        detections = self.refine_detections_with_classifier(image, detections)
+
         # You can set "artifact_found_" to true to signal to "main_loop" that you have found a artifact
         # Since the "image_callback" and "main_loop" methods can run at the same time you should protect any shared variables
         # with a mutex
@@ -931,6 +1003,127 @@ class CaveExplorer(Node):
                 detections.append(Detection(profile['label'], bbox, profile['color_rgb']))
 
         return suppress_overlapping_labels(detections)
+
+    def load_artifact_classifier(self):
+        """
+        Advanced 1: load the trained artefact classifier (see CLASSIFIER_* constants' comment
+        above, and build_classifier_dataset.py for how its training data was produced).
+
+        Returns (interpreter, labels) - labels is a list indexed to match the model's output
+        tensor order. Returns (None, None) if tflite_runtime isn't installed or no exported
+        model is present yet, so the live detector still runs (just without this refinement
+        step) rather than crashing a team member's setup that hasn't done this part.
+        """
+
+        if tflite is None:
+            self.get_logger().warn(
+                'tflite_runtime not installed - skipping artefact classifier (HSV-only detection)')
+            return None, None
+
+        model_dir = os.path.join(
+            get_package_share_directory('cave_explorer'), 'config', 'artifact_classifier')
+        model_path = os.path.join(model_dir, 'model.tflite')
+        labels_path = os.path.join(model_dir, 'labels.txt')
+        if not os.path.exists(model_path) or not os.path.exists(labels_path):
+            self.get_logger().warn(
+                f'No trained artefact classifier found at {model_dir} - skipping (HSV-only detection)')
+            return None, None
+
+        interpreter = tflite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+
+        # labels.txt lines look like "0 green_alien" - the index prefix is Teachable Machine's
+        # own class ordering, already matching the model's output tensor order; only the label
+        # text after it is needed here.
+        labels = []
+        with open(labels_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    labels.append(line.split(' ', 1)[1])
+
+        self.get_logger().info(f'Loaded artefact classifier: {len(labels)} classes from {model_dir}')
+        return interpreter, labels
+
+    def classify_crop(self, image, bbox):
+        """
+        Advanced 1: run the trained classifier on the region of 'image' (RGB) given by 'bbox',
+        returning (predicted_label, confidence). Returns (None, 0.0) if the classifier isn't
+        loaded (see load_artifact_classifier()).
+
+        Crops with the same margin build_classifier_dataset.py used when producing the
+        training images (CLASSIFIER_CROP_MARGIN_PX) - the classifier needs to see the same
+        kind of crop live that it was actually trained on, or this would quietly become a
+        train/inference mismatch and the model's real-world accuracy would no longer match
+        what training suggested.
+        """
+
+        if self.classifier_interpreter_ is None:
+            return None, 0.0
+
+        x, y, w, h = bbox
+        height, width = image.shape[:2]
+        margin = CLASSIFIER_CROP_MARGIN_PX
+        x0, y0 = max(0, x - margin), max(0, y - margin)
+        x1, y1 = min(width, x + w + margin), min(height, y + h + margin)
+        crop = image[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None, 0.0
+
+        resized = cv2.resize(crop, (CLASSIFIER_INPUT_SIZE, CLASSIFIER_INPUT_SIZE))
+        # Teachable Machine's standard MobileNet preprocessing: pixels in [0, 255] -> [-1, 1].
+        normalized = (resized.astype(np.float32) / 127.5) - 1.0
+        input_tensor = np.expand_dims(normalized, axis=0)
+
+        interpreter = self.classifier_interpreter_
+        input_index = interpreter.get_input_details()[0]['index']
+        output_index = interpreter.get_output_details()[0]['index']
+        interpreter.set_tensor(input_index, input_tensor)
+        interpreter.invoke()
+        probabilities = interpreter.get_tensor(output_index)[0]
+
+        best_index = int(np.argmax(probabilities))
+        return self.classifier_labels_[best_index], float(probabilities[best_index])
+
+    def refine_detections_with_classifier(self, image, detections):
+        """
+        Advanced 1: pass each HSV detection (other than CLASSIFIER_SKIP_LABELS) through the
+        trained classifier, using it to confirm, relabel, or reject (drop) the HSV guess - see
+        CLASSIFIER_* constants' comment above for why this exists and what it fixes.
+
+        A low-confidence classifier opinion (below CLASSIFIER_CONFIDENCE_THRESHOLD) is treated
+        as inconclusive rather than acted on - the original HSV label passes through unchanged
+        in that case, rather than risking an uncertain classifier result overriding a perfectly
+        good HSV match.
+        """
+
+        if self.classifier_interpreter_ is None:
+            return detections
+
+        refined = []
+        for detection in detections:
+            if detection.label in CLASSIFIER_SKIP_LABELS:
+                refined.append(detection)
+                continue
+
+            predicted_label, confidence = self.classify_crop(image, detection.bbox)
+            if predicted_label is None or confidence < CLASSIFIER_CONFIDENCE_THRESHOLD:
+                refined.append(detection)
+            elif predicted_label == CLASSIFIER_NEGATIVE_LABEL:
+                self.get_logger().info(
+                    f'    CLASSIFIER: rejected HSV {detection.label} as negative '
+                    f'(confidence {confidence:.2f})')
+                continue  # classifier confident this is a false positive - drop it
+            elif predicted_label != detection.label:
+                self.get_logger().info(
+                    f'    CLASSIFIER: relabelled HSV {detection.label} -> {predicted_label} '
+                    f'(confidence {confidence:.2f})')
+                color_rgb = ARTIFACT_COLOR_BY_LABEL.get(predicted_label, detection.color_rgb)
+                refined.append(Detection(predicted_label, detection.bbox, color_rgb))
+            else:
+                refined.append(detection)
+
+        return refined
 
     def maybe_save_dataset_image(self, image):
         """Perception 1: save the current frame to 'dataset_dir_' if enough time has passed"""
