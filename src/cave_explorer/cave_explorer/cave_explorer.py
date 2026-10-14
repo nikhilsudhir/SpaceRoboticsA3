@@ -553,6 +553,26 @@ MIN_TOUR_PASSAGE_WIDTH_M = 2.0 * ROVER_FOOTPRINT_RADIUS_M
 # abandoning that artefact and resuming exploration.
 INSPECTION_MAX_RETRIES = 1
 
+# A failed goal that concluded faster than this (seconds) tells us nothing about the artefact:
+# the rover never moved, so it cannot have "lost" anything. Nav2 rejects a goal this fast when
+# its behaviour tree couldn't get its own action servers to acknowledge the request in time -
+# see default_server_timeout in nav2_params.yaml, where the live evidence is written up. It is
+# a failure of the navigation stack's internal plumbing, not a fact about the world.
+#
+# Separating the two cases matters because INSPECTION_MAX_RETRIES is small on purpose. With
+# every failure counted alike, two consecutive 0s handshake timeouts - which take well under a
+# second between them - were enough to write an artefact off permanently. That is exactly what
+# happened to green_crystals #62 in live testing: two identical instant aborts on the same
+# 42.6m goal, abandoned without the rover ever having driven towards it.
+GOAL_INSTANT_FAILURE_S = 1.0
+
+# How many instant failures (see GOAL_INSTANT_FAILURE_S) an inspection target may accumulate
+# before they start counting as real attempts after all. Needed as a separate bound because a
+# genuinely unplannable goal also fails instantly, every time, forever - one live goal really
+# was rejected with "GridBased failed to generate a valid path" rather than a handshake
+# timeout, and without a ceiling here that artefact would be retried for the whole mission.
+INSPECTION_MAX_INSTANT_RETRIES = 3
+
 # Planning 1 robustness: how many random points planner_random_walk() tries before giving up
 # and holding position, when looking for one that's actually navigable (see is_point_navigable()).
 RANDOM_WALK_MAX_ATTEMPTS = 30
@@ -726,7 +746,14 @@ class CaveExplorer(Node):
         self.visited_artifact_ids_ = set()
         self.abandoned_artifact_ids_ = set()
         self.inspection_attempts_ = 0
+        # Instant failures for the current target, counted separately from inspection_attempts_
+        # so Nav2 plumbing hiccups can't write an artefact off - see GOAL_INSTANT_FAILURE_S.
+        self.inspection_instant_failures_ = 0
         self.last_goal_succeeded_ = None
+        # How long the most recently concluded goal lasted, in seconds. Recorded by
+        # log_goal_outcome(), which every goal conclusion path already funnels through, so
+        # main_loop can tell "Nav2 never started" from "the rover tried and failed".
+        self.last_goal_duration_s_ = 0.0
         self.visited_markers_pub_ = self.create_publisher(
             MarkerArray, 'artifact_inspection_status_markers', 1)
 
@@ -1998,15 +2025,28 @@ class CaveExplorer(Node):
 
         elapsed_s = (self.get_clock().now() - self.goal_sent_time_).nanoseconds / 1e9 \
             if self.goal_sent_time_ is not None else 0.0
+        self.last_goal_duration_s_ = elapsed_s
 
-        if self.goal_initial_distance_m_ is not None and elapsed_s > 0:
-            avg_speed = self.goal_initial_distance_m_ / elapsed_s
-            self.get_logger().info(
-                f'    <- {outcome_text} in {elapsed_s:.0f}s '
-                f'({self.goal_initial_distance_m_:.1f}m, avg {avg_speed:.2f} m/s)')
-            self.total_distance_m_ += self.goal_initial_distance_m_
-        else:
+        if self.goal_initial_distance_m_ is None or elapsed_s <= 0:
             self.get_logger().info(f'    <- {outcome_text}')
+            return
+
+        # A goal that concluded instantly never moved the rover, so neither the distance nor a
+        # speed derived from it means anything - and crediting it to the mission total actively
+        # corrupts the headline figure. green_crystals #62's 42.6m goal was rejected twice in 0s
+        # and contributed 85.2m the rover never drove, inflating MISSION COMPLETE's average
+        # speed. Report the outcome, say how far away the goal had been, and claim nothing else.
+        if elapsed_s < GOAL_INSTANT_FAILURE_S:
+            self.get_logger().info(
+                f'    <- {outcome_text} immediately ({elapsed_s:.2f}s, no movement; '
+                f'the goal was {self.goal_initial_distance_m_:.1f}m away)')
+            return
+
+        avg_speed = self.goal_initial_distance_m_ / elapsed_s
+        self.get_logger().info(
+            f'    <- {outcome_text} in {elapsed_s:.0f}s '
+            f'({self.goal_initial_distance_m_:.1f}m, avg {avg_speed:.2f} m/s)')
+        self.total_distance_m_ += self.goal_initial_distance_m_
 
     def abandon_current_goal(self, outcome_text='abandoned'):
         """
@@ -2889,6 +2929,15 @@ class CaveExplorer(Node):
         all still worth visiting, so spending retries (and goal timeouts) on one awkward
         viewpoint at the cost of the rest of the tour is the wrong trade. The missed stop stays
         visible in RViz as an orange marker, so it's reported rather than quietly dropped.
+
+        The one exception is a goal Nav2 threw out before the rover moved (see
+        GOAL_INSTANT_FAILURE_S), which is re-sent instead. That trade-off is different because
+        an instant rejection costs no driving time at all, so re-sending it doesn't come at the
+        expense of the rest of the tour - and the stop hasn't actually been attempted yet.
+        Scoring these as misses understated the result: of the 3 stops recorded missed in live
+        testing, 2 were instant rejections at 9.6m and 9.1m, so the honest figure was 11/12
+        rather than 9/12. Bounded per stop, so an unplannable viewpoint is still reported missed
+        rather than stalling the tour on it.
         """
 
         order = self.tour_['optimised_order']
@@ -2899,6 +2948,18 @@ class CaveExplorer(Node):
             # pause_mission_callback()). Leave the index alone so this same stop is re-sent.
             self.goal_cancelled_by_pause_ = False
             self.get_logger().info(f"    (resuming tour stop '{stop['label']}' after pause)")
+            return
+
+        instant_retries = stop.get('instant_retries', 0)
+        if not self.last_goal_succeeded_ \
+                and self.last_goal_duration_s_ < GOAL_INSTANT_FAILURE_S \
+                and instant_retries < INSPECTION_MAX_INSTANT_RETRIES:
+            # Nav2 rejected the goal before the rover moved - see the docstring. Leave the index
+            # alone so this same stop is re-sent, exactly as the pause case above does.
+            stop['instant_retries'] = instant_retries + 1
+            self.get_logger().warn(
+                f"    RETRY: tour stop '{stop['label']}' - Nav2 rejected the goal before the "
+                f"rover moved ({stop['instant_retries']}/{INSPECTION_MAX_INSTANT_RETRIES})")
             return
 
         if self.last_goal_succeeded_:
@@ -3040,6 +3101,7 @@ class CaveExplorer(Node):
                 self.abandon_current_goal('preempted')
                 self.inspection_target_ = preempting_target
                 self.inspection_attempts_ = 0
+                self.inspection_instant_failures_ = 0
                 self.planner_type_ = PlannerType.INSPECT_ARTIFACT
                 self.publish_visited_artifact_markers()
                 self.log_episode_start(self.planner_type_.name)
@@ -3123,16 +3185,34 @@ class CaveExplorer(Node):
                 self.visited_artifact_ids_.add(self.inspection_target_['id'])
                 self.inspection_target_ = None
                 self.inspection_attempts_ = 0
+                self.inspection_instant_failures_ = 0
+            elif self.last_goal_duration_s_ < GOAL_INSTANT_FAILURE_S \
+                    and self.inspection_instant_failures_ < INSPECTION_MAX_INSTANT_RETRIES:
+                # Nav2 threw the goal out before the rover moved - see GOAL_INSTANT_FAILURE_S.
+                # Retry without spending an attempt, because nothing has been learnt about the
+                # artefact: counting these was abandoning science targets over handshake
+                # timeouts inside the navigation stack. Bounded by INSPECTION_MAX_INSTANT_RETRIES
+                # so a genuinely unplannable goal still gets written off rather than looping.
+                self.inspection_instant_failures_ += 1
+                self.get_logger().warn(
+                    f"    RETRY: {self.inspection_target_['label']} "
+                    f"#{self.inspection_target_['id']} - Nav2 rejected the goal before the rover "
+                    f"moved ({self.inspection_instant_failures_}/{INSPECTION_MAX_INSTANT_RETRIES}), "
+                    f"not counting it as a failed approach")
+                # inspection_target_ stays set, so it's retried below
             else:
                 self.inspection_attempts_ += 1
                 if self.inspection_attempts_ > INSPECTION_MAX_RETRIES:
                     self.get_logger().warn(
                         f"    DONE: {self.inspection_target_['label']} "
                         f"#{self.inspection_target_['id']} abandoned after "
-                        f"{self.inspection_attempts_} failed attempt(s)")
+                        f"{self.inspection_attempts_} failed attempt(s)"
+                        + (f" and {self.inspection_instant_failures_} instant rejection(s)"
+                           if self.inspection_instant_failures_ else ''))
                     self.abandoned_artifact_ids_.add(self.inspection_target_['id'])
                     self.inspection_target_ = None
                     self.inspection_attempts_ = 0
+                    self.inspection_instant_failures_ = 0
                 # else: inspection_target_ stays set, so it's retried below
         elif self.planner_type_ == PlannerType.SCIENCE_TOUR:
             # Advanced 5: the goal for the current tour stop just finished
@@ -3149,6 +3229,7 @@ class CaveExplorer(Node):
                     f"#{pending_target['id']} is still pending - resuming inspection")
                 self.inspection_target_ = pending_target
                 self.inspection_attempts_ = 0
+                self.inspection_instant_failures_ = 0
             else:
                 elapsed_s = (self.get_clock().now() - self.start_time_).nanoseconds / 1e9
                 outcome = 'reached base' if self.last_goal_succeeded_ else "didn't quite reach base"
@@ -3166,6 +3247,7 @@ class CaveExplorer(Node):
         if self.inspection_target_ is None:
             self.inspection_target_ = self.find_inspection_target()
             self.inspection_attempts_ = 0
+            self.inspection_instant_failures_ = 0
 
         if self.inspection_target_ is not None:
             self.planner_type_ = PlannerType.INSPECT_ARTIFACT

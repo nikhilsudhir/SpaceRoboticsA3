@@ -45,8 +45,27 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom
-    bt_loop_duration: 10
-    default_server_timeout: 20
+    # Was 10 (= 100Hz). The log was full of "Behavior Tree tick rate 100.00 was exceeded!",
+    # i.e. the BT could not actually sustain the rate it was asked for - this machine runs
+    # Gazebo Fortress with software rendering (llvmpipe) alongside the whole Nav2 + SLAM stack,
+    # so CPU is the binding constraint. 50Hz is still far more than a 1m/s rover needs, and
+    # halving the BT's own tick cost leaves more CPU for the servers it has to talk to (which
+    # is what default_server_timeout below is about).
+    bt_loop_duration: 20
+    # Milliseconds the BT's action clients wait for compute_path_to_pose / follow_path to
+    # ACKNOWLEDGE a goal request - not to serve it. Was 20 (the upstream Nav2 default), which
+    # assumes a machine where an action handshake always completes in under 20ms. This one is
+    # not that machine: 14 of 62 goals in a live run were aborted by Nav2 in 0s, and the logs
+    # name the cause for 11 of them - "Timed out while waiting for action server to acknowledge
+    # goal request for compute_path_to_pose" (and the same for follow_path). Those goals were
+    # ordinary reachable coordinates spread across the map; nothing was wrong with them, the
+    # planner simply had not been scheduled yet when the 20ms window closed. Only one of the 14
+    # was a genuine planning failure ("GridBased failed to generate a valid path").
+    #
+    # 250ms is generous for a handshake but still 180x smaller than GOAL_TIMEOUT_S in
+    # cave_explorer.py, which is what actually bounds a stuck goal. It costs nothing when the
+    # servers are responsive, because this is a timeout, not a delay.
+    default_server_timeout: 250
     wait_for_service_timeout: 1000
     # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
     # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
