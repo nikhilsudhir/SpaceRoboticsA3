@@ -2,6 +2,22 @@
 
 ROS2 workspace for the 49274 Space Robotics team project (brief in [`team_project_2026.pdf`](team_project_2026.pdf)): an autonomously exploring Mars rover that maps a simulated Martian cave, and detects and localises artefacts of interest.
 
+## Quick reference
+
+Once you've done the one-time [build](#building), this is the full sequence to launch and run a mission. **Every new terminal needs `source ~/ros2_ws/install/setup.bash` first** — skipping it is the #1 cause of `Package 'cave_explorer' not found`.
+
+```bash
+# Terminal 1 - everything (Gazebo/RViz, SLAM+Nav2, autonomy node)
+source ~/ros2_ws/install/setup.bash
+ros2 launch cave_explorer cave_explorer_all.launch.py
+
+# Terminal 2 - the GUI, once terminal 1 has finished starting up
+source ~/ros2_ws/install/setup.bash
+ros2 run cave_explorer gui
+```
+
+Then click **Start Exploring** in the GUI (or run `ros2 service call /start_mission std_srvs/srv/Trigger {}`). See [Running the simulation](#running-the-simulation) below for every launch argument and the three-separate-launch-files alternative, and [Mission Control GUI](#mission-control-gui) for what the GUI shows/controls.
+
 ## Layout
 
 This repo holds the source packages, not the colcon workspace itself. Each folder under `src/` is one ROS2 package:
@@ -46,6 +62,12 @@ The [Mission Control GUI](#mission-control-gui) needs PyQt5:
 
 ```bash
 sudo apt install python3-pyqt5
+```
+
+Optional, only if you want to manually drive the robot (e.g. while collecting the [Perception 1 dataset](#collecting-a-dataset-perception-1) by hand instead of relying on random exploration):
+
+```bash
+sudo apt install ros-humble-teleop-twist-keyboard
 ```
 
 ## Building
@@ -126,13 +148,17 @@ The autonomy node can save camera frames to disk for building a training/test da
 ros2 launch cave_explorer cave_explorer_autonomy.launch.py dataset_dir:=/home/$USER/cave_dataset
 ```
 
-This saves a frame at most once every `dataset_save_period` seconds (default `2.0`) to `dataset_dir` as `frame_<timestamp>.png`. You can also save the current frame on demand at any time (e.g. while lining up a good shot of an artefact with `teleop_twist_keyboard`) by calling:
+This saves a frame at most once every `dataset_save_period` seconds (default `2.0`) to `dataset_dir` as `frame_<timestamp>.png` — override it with e.g. `dataset_save_period:=0.5` for more frequent saves. You can also save the current frame on demand at any time (e.g. while lining up a good shot of an artefact with `teleop_twist_keyboard`) by calling:
 
 ```bash
 ros2 service call /save_dataset_image std_srvs/srv/Trigger {}
 ```
 
-Drive the robot around (random walk/goals, waypoints, or teleop — see Perception 1 in the project brief) while this is running, then sort the saved images into per-artefact-type folders afterwards.
+Drive the robot around (random walk/goals, waypoints, or teleop — see Perception 1 in the project brief) while this is running, then sort the saved images into per-artefact-type folders afterwards. To teleoperate directly instead of relying on the robot's own random walk (needs `ros-humble-teleop-twist-keyboard` — see [Prerequisites](#prerequisites)):
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
 
 ### Autonomous exploration and artefact inspection (Planning 1–3)
 
@@ -140,6 +166,14 @@ Once all three launch files are running, the robot is ready to explore and inspe
 
 ```bash
 ros2 service call /start_mission std_srvs/srv/Trigger {}
+```
+
+The GUI's other mission controls are also just `std_srvs/srv/Trigger` services, callable the same way without the GUI open:
+
+```bash
+ros2 service call /pause_mission std_srvs/srv/Trigger {}
+ros2 service call /resume_mission std_srvs/srv/Trigger {}
+ros2 service call /force_return_home std_srvs/srv/Trigger {}
 ```
 
 In RViz:
@@ -173,6 +207,12 @@ Controls:
 - **Manual Override** (D-pad) — drive the robot directly via `/cmd_vel`. Only ever enabled while the mission is paused, not yet started, or already complete - **never** while `main_loop()` is actively driving, since autonomous and manual `cmd_vel` commands fighting each other would cause erratic motion. The buttons are disabled automatically outside those states, and switching back out of them forces an immediate zero-velocity stop.
 
 All of this is driven by one JSON-encoded topic, `gui_status`, published once a second by `cave_explorer_node` (see `publish_gui_status()`) - a custom message type wasn't worth the `.msg` package/rebuild for what's purely a GUI convenience. Any other tool (or a second GUI instance) can read the same topic.
+
+## Troubleshooting
+
+- **`Package 'cave_explorer' not found`** — this terminal hasn't sourced the workspace overlay. Run `source ~/ros2_ws/install/setup.bash` (every new terminal needs this, including ones you've already used for other commands like `cd`).
+- **Nothing happens after launching, or an old build of your code seems to run** — if you changed `setup.py`, `package.xml`, or a non-Python file (launch/config), you need to rebuild: `colcon build --symlink-install --packages-select cave_explorer` then re-source. Plain `.py` edits under `cave_explorer/` are picked up automatically thanks to `--symlink-install`.
+- **The robot never starts moving** — it waits for the `start_mission` trigger (see [Autonomous exploration](#autonomous-exploration-and-artefact-inspection-planning-13) above) rather than beginning automatically; click **Start Exploring** in the GUI or call the service directly.
 
 ## Development notes
 
