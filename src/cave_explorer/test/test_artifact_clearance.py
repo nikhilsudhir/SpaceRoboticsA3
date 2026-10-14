@@ -232,6 +232,38 @@ def test_empty_world_accepts_everything():
 
 
 # --------------------------------------------------------------------------------------------
+# Passage width: the clearance check above needs perception to have confirmed the artefact,
+# so it cannot protect a bottleneck stop in a part of the cave the cameras haven't resolved.
+# The width gate is the backstop that doesn't depend on perception at all.
+# --------------------------------------------------------------------------------------------
+
+def test_passage_gate_rejects_anything_narrower_than_the_rover():
+    """
+    The rover is a 1x1m box; it needs a free disc of its footprint radius to sit anywhere.
+    The 0.6m passage that was toured and missed in testing must now be refused outright.
+    """
+
+    assert 0.6 < cave_explorer.MIN_TOUR_PASSAGE_WIDTH_M, \
+        'the 0.6m passage that wedged the rover would still be accepted as a tour stop'
+    assert cave_explorer.MIN_TOUR_PASSAGE_WIDTH_M == \
+        pytest.approx(2.0 * cave_explorer.ROVER_FOOTPRINT_RADIUS_M), \
+        'the gate must stay tied to the footprint, not drift into a magic number'
+
+
+def test_passage_gate_still_allows_genuinely_traversable_passages():
+    """
+    The gate must not quietly delete the whole bottleneck category - Advanced 5 is supposed to
+    tour narrow passages, just not impossible ones. A passage comfortably wider than the rover
+    still has to qualify.
+    """
+
+    assert cave_explorer.MIN_TOUR_PASSAGE_WIDTH_M < 2.0, \
+        'a 2m-wide passage is plainly drivable and must still be eligible'
+    assert cave_explorer.MIN_TOUR_PASSAGE_WIDTH_M >= 1.0, \
+        'the rover body alone is 1m across; the gate must be at least that'
+
+
+# --------------------------------------------------------------------------------------------
 # The constants, measured against the world files
 # --------------------------------------------------------------------------------------------
 

@@ -541,6 +541,13 @@ ROVER_FOOTPRINT_RADIUS_M = 0.71
 # comfortably outside the artefact rather than exactly touching it.
 ARTIFACT_STANDOFF_MARGIN_M = 0.4
 
+# Narrowest passage (metres) the rover can actually be sent into, as a tour stop. The rover needs
+# a free disc of ROVER_FOOTPRINT_RADIUS_M around its centre to sit anywhere and turn, so that is
+# a diameter of twice the footprint radius; anything tighter is unreachable by construction and
+# Nav2's inflation layer (inflation_radius 1.0m in nav2_params.yaml) will refuse to plan into it
+# regardless. Advanced 2 is right to *report* a 0.6m passage - it just isn't somewhere to drive.
+MIN_TOUR_PASSAGE_WIDTH_M = 2.0 * ROVER_FOOTPRINT_RADIUS_M
+
 # Planning 3: if a close-range inspection goal doesn't succeed (Nav2 aborts/rejects it - e.g.
 # the artefact's standoff point turned out to be unreachable), retry it this many times before
 # abandoning that artefact and resuming exploration.
@@ -2604,6 +2611,15 @@ class CaveExplorer(Node):
                         (navigable[0], navigable[1],
                          f"chamber {2.0 * chamber['clearance_m']:.1f}m", 'chamber'))
             for bottleneck in self.geometry_['bottlenecks']:
+                # A passage narrower than the rover is not a place the rover can stand, whatever
+                # the map says. The clearance check below is deliberately relaxed (2 cells, 0.6m)
+                # so genuinely tight-but-passable routes still qualify, and that relaxation is
+                # exactly what let a 0.6m "passage" through in testing - it sat 0.12m inside an
+                # undetected mushroom cluster at (-3.3, 29.2) and was duly toured and missed.
+                # Gating on the measured width catches that case without needing perception to
+                # have confirmed the artefact first.
+                if bottleneck['width_m'] < MIN_TOUR_PASSAGE_WIDTH_M:
+                    continue
                 x, y = self.grid_to_world(bottleneck['row'], bottleneck['col'])
                 navigable = self.find_nearest_navigable_point(x, y, clearance_cells=2)
                 if navigable is not None and self.is_clear_of_artifacts(navigable[0], navigable[1]):
