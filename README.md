@@ -29,6 +29,9 @@ As more packages are added, each new one should get its own folder under `src/`.
 Inside `src/cave_explorer/`:
 
 - `cave_explorer/cave_explorer.py` — the main ROS2 node. This is where most of the project's decision-making, perception and planning code lives.
+- `cave_explorer/cave_geometry.py` — Advanced 2 cave-shape analysis (numpy/OpenCV only, no ROS, so it's testable offline).
+- `cave_explorer/science_tour.py` — Advanced 5 route optimisation (standard library only, same reason).
+- `test/` — offline tests for the two above, runnable without ROS (see [Tests](#tests)).
 - `launch/` — a combined launch file plus the three underlying launch files it includes (see [Running the simulation](#running-the-simulation) below).
 - `config/` — Nav2, SLAM, EKF (`robot_localization`), RViz and Gazebo topic-bridge parameters, plus the OpenCV cascade classifier used for the starter artefact detector (`stop_data.xml`).
 - `urdf/` — the rover's URDF/xacro description and meshes.
@@ -183,6 +186,60 @@ In RViz:
 
 Only `blue_cube`, `white_sphere`, and `green_crystals` (`INSPECTION_ARTIFACT_LABELS` in `cave_explorer.py`) trigger close-range inspection — these were judged the most visually distinct of Perception 2's colour profiles. When one is detected, the robot pauses exploring, navigates to a standoff viewpoint (`INSPECTION_STANDOFF_DISTANCE_M`, default 2 m) facing it, then resumes exploring. A failed approach is retried once (`INSPECTION_MAX_RETRIES`) before being abandoned.
 
+### Cave geometry analysis (Advanced 2)
+
+Runs automatically in the background from the moment the node starts — no trigger, no extra launch file. Every `GEOMETRY_UPDATE_PERIOD_S` (5 s) the node re-analyses the current SLAM map and reports the **widest accessible areas** (chambers) and the **narrowest passages** (bottlenecks), with each one's width in metres. Findings are logged whenever the numbers change materially, so the terminal doesn't repeat itself once they settle.
+
+The method (all in `cave_geometry.py`):
+
+1. A **distance transform** turns the occupancy grid into a clearance map — each free cell's distance to the nearest obstacle, in metres. Unknown cells are deliberately treated as walls: unexplored space is not known to be open, so assuming otherwise would overstate clearance near the frontier.
+2. Clearance **peaks** are chambers; the widest reachable one is the answer to "largest accessible area". Reachability comes from the same wavefront used for path costs, so a sealed void the rover can't drive into is never reported.
+3. Bottlenecks come from the **second derivatives** (a Sobel Hessian) of the smoothed clearance map: `det(H) < 0` means the eigenvalues have opposite signs, i.e. a **saddle point** — clearance is at a maximum across the passage but a minimum along it, which is exactly what a pinch point looks like. The candidates are then restricted to the corridor **centreline** (`find_ridge()`); without that, concave wall corners pass the saddle test too and swamp the real passages.
+
+Measurements and thresholds read the raw distance transform, not the smoothed copy — smoothing is only used where derivatives are taken, since it pulls in zeros from outside free space and shaves ~0.4 m off a 6 m chamber.
+
+In RViz:
+
+- **`cave_geometry_markers`** — green discs at the widest areas, red discs at the narrowest passages, each sized to the actual inscribed circle, with a text label giving the width in metres.
+- **`clearance_map`** — the clearance map itself as an `OccupancyGrid` overlay, scaled so `CLEARANCE_DISPLAY_MAX_M` (5 m) is full scale. Add it as a **Map** display, but set its **Color Scheme to `costmap`**, not the default `map` — the default renders everything as black/white and you'll see nothing useful. Its QoS is transient-local (latched) to match RViz's Map display default, so it appears immediately rather than after the next 5 s tick.
+
+### Science tour route optimisation (Advanced 5)
+
+When exploration finishes, instead of driving straight home the rover plans and drives an optimised **science tour**: a closed route from base, through the best science stops, and back to base.
+
+Stops are chosen by quota — up to 6 confirmed artefacts, 4 chambers and 3 bottlenecks from the Advanced 2 analysis — then topped up to between `TOUR_MIN_LOCATIONS` (8) and `TOUR_MAX_LOCATIONS` (12), with nearby duplicates dropped. Artefact stops are standoff viewpoints facing the artefact, not the artefact's own position. Location 0 is base, so the planned loop and the driven route match exactly (the final leg home is the existing `RETURN_HOME` behaviour).
+
+The cost matrix is built by running the node's wavefront BFS over the occupancy grid, so every leg is a **path distance through the map, not a straight line** — two chambers either side of a wall are close in a straight line and far by road, and a straight-line tour would plan a route through solid rock. Legs with no route at all are marked `-1`, which keeps "unreachable" distinguishable from "far"; a stop with no reachable legs is dropped from the tour rather than driven at.
+
+Then two stages, both in `science_tour.py`:
+
+- **Baseline** — nearest neighbour. Always hop to the closest unvisited stop. Short-sighted: it strands a location on the far side of the cave and makes a long dedicated trip back for it.
+- **Optimised** — 2-opt. Repeatedly swap two tour edges for a cheaper pair (implemented as reversing the segment between them) until no swap helps. This is what untangles those backtracks.
+
+Both totals are logged, with the saving in metres and percent — the before/after comparison the task asks for. On the test instance the optimised tour matched the brute-forced exact optimum.
+
+Controls:
+
+```bash
+# Run the tour now, mid-mission, without waiting for exploration to finish
+ros2 service call /start_science_tour std_srvs/srv/Trigger {}
+
+# Or disable the automatic post-exploration tour entirely (default: true)
+ros2 run cave_explorer cave_explorer --ros-args -p science_tour_on_completion:=false
+```
+
+In RViz, **`science_tour_markers`** draws both routes as line strips — the faint lower one is the nearest-neighbour baseline, the bright upper one the optimised tour — so the saving is visible at a glance rather than only as a number in the log. Stops are spheres numbered in visiting order and colour-coded by progress: **yellow** = pending, **green** = visited, **orange** = missed. The lines are straight between consecutive stops, i.e. a diagram of the visiting *order*; the actual driven path follows the corridors (Nav2 plans that), and the costs behind the ordering are those real path distances.
+
+### Tests
+
+`src/cave_explorer/test/test_advanced_tasks.py` checks both Advanced tasks against a synthetic cave with known dimensions (chambers of 6.0 m, 4.4 m and 3.2 m joined by 0.8 m and 1.2 m corridors) and against a brute-forced optimal tour. It needs no ROS, Gazebo or SLAM — only numpy, OpenCV and pytest — and runs in under a second:
+
+```bash
+cd src/cave_explorer && python3 -m pytest test/test_advanced_tasks.py -v
+```
+
+That's the point of keeping `cave_geometry.py` and `science_tour.py` ROS-free: getting the same evidence from the simulator would mean driving the rover around and eyeballing RViz markers.
+
 ### Mission Control GUI
 
 A standalone PyQt5 dashboard (`cave_explorer/gui.py`), separate from RViz, for monitoring a run and starting it:
@@ -212,6 +269,8 @@ All of this is driven by one JSON-encoded topic, `gui_status`, published once a 
 
 - **`Package 'cave_explorer' not found`** — this terminal hasn't sourced the workspace overlay. Run `source ~/ros2_ws/install/setup.bash` (every new terminal needs this, including ones you've already used for other commands like `cd`).
 - **Nothing happens after launching, or an old build of your code seems to run** — if you changed `setup.py`, `package.xml`, or a non-Python file (launch/config), you need to rebuild: `colcon build --symlink-install --packages-select cave_explorer` then re-source. Plain `.py` edits under `cave_explorer/` are picked up automatically thanks to `--symlink-install`.
+- **`clearance_map` looks blank or solid black in RViz** — its Map display is still on the default `map` colour scheme, which renders the 0–100 clearance values as near-black. Switch that display's **Color Scheme** to `costmap`.
+- **The science tour is skipped with "not enough locations"** — the tour needs at least `TOUR_MIN_LOCATIONS` (8) distinct stops, and a short run in a small part of the cave may not produce that many artefacts and geometry features. Explore longer, or lower the constant in `cave_explorer.py`.
 - **The robot never starts moving** — it waits for the `start_mission` trigger (see [Autonomous exploration](#autonomous-exploration-and-artefact-inspection-planning-13) above) rather than beginning automatically; click **Start Exploring** in the GUI or call the service directly.
 
 ## Development notes

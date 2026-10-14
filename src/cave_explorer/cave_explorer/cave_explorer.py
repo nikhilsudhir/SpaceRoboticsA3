@@ -19,6 +19,7 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -28,6 +29,8 @@ from tf2_ros.transform_listener import TransformListener
 
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
+
+from cave_explorer import cave_geometry, science_tour
 
 
 def wrap_angle(angle):
@@ -263,6 +266,7 @@ class PlannerType(Enum):
     RANDOM_GOAL = 5
     EXPLORE_FRONTIER = 6
     INSPECT_ARTIFACT = 7
+    SCIENCE_TOUR = 8
     # Add more!
 
 
@@ -492,6 +496,54 @@ GOAL_PROGRESS_STALL_S = 40.0
 # rather than feedback noise/jitter resetting the GOAL_PROGRESS_STALL_S timer forever.
 GOAL_PROGRESS_EPSILON_M = 0.15
 
+# Advanced 2: how often (seconds) to re-run the cave geometry analysis - see
+# update_cave_geometry(). The task asks for the distance transform to be computed/updated
+# online, so this runs throughout the mission rather than once at the end. Deliberately much
+# slower than the 0.2s main loop: the analysis is a handful of whole-map numpy/OpenCV passes
+# (distance transform, blur, four Sobels) plus a full-map BFS for the reachability mask, and the
+# results only change as fast as SLAM reveals new cave - several seconds between updates is
+# visually continuous in RViz while leaving the CPU to Nav2 and this node's own camera/tf
+# callbacks (the same starvation concern documented on compute_path_distance_grid()).
+GEOMETRY_UPDATE_PERIOD_S = 5.0
+
+# Advanced 2: clearance (metres) displayed as the top of the colour scale when the distance
+# transform is published as an OccupancyGrid overlay - see publish_clearance_map(). Anything
+# more open than this saturates. Occupancy grids only carry 0-100, so the clearance has to be
+# squashed into that range somehow; this makes the mapping explicit and readable rather than
+# dependent on whatever the widest cell on the current map happens to be (which would make the
+# colours mean something different every update).
+CLEARANCE_DISPLAY_MAX_M = 5.0
+
+# Advanced 2: features closer together than this (metres) in the geometry analysis are treated
+# as the same place. Mirrors cave_geometry.MIN_FEATURE_SEPARATION_M, and is also used when
+# assembling the science tour so two "different" stops can't be the same spot twice.
+GEOMETRY_FEATURE_SEPARATION_M = 4.0
+
+# Advanced 5: the science tour visits between this many locations. The lower bound is the
+# task's own requirement (at least 8 meaningful locations); the upper bound keeps the tour
+# driveable in a demo run and keeps cost-matrix construction cheap - it costs one full-map BFS
+# per location (see build_tour_cost_matrix()), so this is the knob that bounds that work.
+TOUR_MIN_LOCATIONS = 8
+TOUR_MAX_LOCATIONS = 12
+
+# Advanced 5: how far (metres) from an artefact the tour stops, so a science stop is a viewpoint
+# of the artefact rather than a point inside it (the artefact itself is an obstacle in the map).
+# Matches the Planning 2 inspection standoff for consistency between the two behaviours.
+TOUR_ARTIFACT_STANDOFF_M = INSPECTION_STANDOFF_DISTANCE_M
+
+# Advanced 5: two tour stops closer together than this (metres) are treated as the same place
+# and only one is kept - see collect_science_locations(). Smaller than
+# GEOMETRY_FEATURE_SEPARATION_M because stops come from different sources (an artefact viewpoint
+# and a chamber centre can legitimately be a few metres apart and still be two different
+# reasons to go somewhere); this only needs to catch stops that are effectively identical.
+TOUR_MIN_STOP_SEPARATION_M = 2.5
+
+# Advanced 5: how far (metres) to search outward for a navigable cell when a nominal tour
+# location isn't driveable - see find_nearest_navigable_point(). Geometry features are always
+# in free space by construction, but artefact positions are estimates that can land inside a
+# wall or inside the artefact's own footprint, so they need nudging to somewhere reachable.
+TOUR_SNAP_SEARCH_RADIUS_M = 3.0
+
 
 class CaveExplorer(Node):
     def __init__(self):
@@ -653,6 +705,9 @@ class CaveExplorer(Node):
 
         # GUI control: pause/resume - see pause_mission_callback()/resume_mission_callback().
         self.mission_paused_ = False
+        # Set when pausing cancelled an in-flight goal, so the behaviour it belonged to can tell
+        # that apart from the goal genuinely failing - see pause_mission_callback().
+        self.goal_cancelled_by_pause_ = False
         self.pause_mission_srv_ = self.create_service(
             Trigger, 'pause_mission', self.pause_mission_callback)
         self.resume_mission_srv_ = self.create_service(
@@ -661,6 +716,49 @@ class CaveExplorer(Node):
         # GUI control: skip straight to RETURN_HOME - see force_return_home_callback().
         self.force_return_home_srv_ = self.create_service(
             Trigger, 'force_return_home', self.force_return_home_callback)
+
+        # Advanced 2: cave geometry analysis - see update_cave_geometry(). 'geometry_' holds the
+        # latest result from cave_geometry.analyse_cave() (the clearance map plus the chamber and
+        # bottleneck lists), recomputed on a timer as the map grows.
+        self.geometry_ = None
+        self.geometry_markers_pub_ = self.create_publisher(MarkerArray, 'cave_geometry_markers', 1)
+        # The distance transform itself, republished as an OccupancyGrid so it can be displayed
+        # in RViz with a normal Map display. Latched (transient-local) QoS to match RViz's own
+        # default for Map displays, so a display added mid-run gets the current analysis
+        # immediately instead of showing nothing until the next GEOMETRY_UPDATE_PERIOD_S tick.
+        self.clearance_map_pub_ = self.create_publisher(
+            OccupancyGrid, 'clearance_map',
+            QoSProfile(depth=1,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        # Logging only: the headline widest/narrowest values last reported, so update_cave_geometry()
+        # can log when the answer actually changes instead of every few seconds forever.
+        self.last_logged_widest_m_ = None
+        self.last_logged_narrowest_m_ = None
+        self.geometry_timer_ = self.create_timer(
+            GEOMETRY_UPDATE_PERIOD_S, self.update_cave_geometry)
+
+        # Advanced 5: science tour. 'tour_' is the planned route (see plan_science_tour()):
+        # the chosen locations, the nearest-neighbour baseline, the 2-opt optimised order, and
+        # the cost comparison between them. 'tour_stop_index_' is how far through the optimised
+        # order execution has got.
+        self.tour_ = None
+        self.tour_stop_index_ = 0
+        self.tour_complete_ = False
+        # Set when the tour can't be planned (not enough distinct reachable locations), so it
+        # isn't retried on every tick for the rest of the mission.
+        self.tour_planning_failed_ = False
+        # Set by the start_science_tour service, to run the tour on demand mid-mission (e.g. for
+        # a demo) rather than waiting for exploration to finish naturally.
+        self.tour_requested_ = False
+        self.tour_markers_pub_ = self.create_publisher(MarkerArray, 'science_tour_markers', 1)
+        self.start_science_tour_srv_ = self.create_service(
+            Trigger, 'start_science_tour', self.start_science_tour_callback)
+        # Whether to run the tour automatically once exploration completes. On by default (it's
+        # the natural end-of-mission behaviour: the cave is mapped, so now go and revisit
+        # everything worth revisiting), but can be turned off to get the plain Planning 1-3
+        # behaviour back without editing code.
+        self.declare_parameter('science_tour_on_completion', True)
 
         # Timer for main loop
         self.main_loop_timer_ = self.create_timer(0.2, self.main_loop)
@@ -920,6 +1018,13 @@ class CaveExplorer(Node):
         self.mission_paused_ = True
         if self.planner_type_ != PlannerType.RETURN_HOME and self.current_goal_handle_ is not None:
             self.current_goal_handle_.cancel_goal_async()
+            # Cancelling makes the goal report as not-succeeded, which is indistinguishable from
+            # a genuine failure to whatever is tracking the current goal's outcome. Flagged here
+            # so a cancelled-by-pause goal can be retried on resume rather than counted as a
+            # failure - see advance_science_tour(), where a "failed" tour stop is permanently
+            # recorded as missed, so pausing mid-tour (very likely during a demo) would otherwise
+            # silently cost a stop.
+            self.goal_cancelled_by_pause_ = True
         self.get_logger().info('Mission paused')
         response.success = True
         response.message = 'Mission paused'
@@ -1622,6 +1727,10 @@ class CaveExplorer(Node):
         distance-scaled one instead of the default.
         """
 
+        # Any pause-cancelled goal has been dealt with by whatever was tracking it by now (see
+        # pause_mission_callback()); clear the flag so it can't leak into the next behaviour.
+        self.goal_cancelled_by_pause_ = False
+
         # Send a goal to navigate_to_pose with self.nav2_action_client_
         action_goal = NavigateToPose.Goal()
         action_goal.pose.header.stamp = self.get_clock().now().to_msg()
@@ -1838,6 +1947,681 @@ class CaveExplorer(Node):
         )
         self.planner_go_to_pose2d(goal_pose2d)
 
+    #######################################################
+    # Advanced 2: cave geometry analysis.
+    #
+    # The analysis itself lives in cave_geometry.py (pure numpy/OpenCV, no ROS) - see that
+    # module's docstring for the method. Everything here is the ROS side of it: when it runs,
+    # what it runs on, and how the results get into RViz and the logs.
+
+    def find_nearest_navigable_point(self, x, y, clearance_cells=3,
+                                     search_radius_m=TOUR_SNAP_SEARCH_RADIUS_M):
+        """
+        Return the navigable point nearest to (x, y), or None if there isn't one within
+        search_radius_m.
+
+        Needed because a "meaningful location" isn't necessarily a drivable one. An artefact's
+        estimated position is the artefact itself - i.e. an obstacle - and the estimate can be a
+        little off besides, so it often lands inside a wall or in unexplored space. Searching
+        outward in rings and taking the first navigable hit keeps the stop as close as possible
+        to the thing it's meant to be a stop for, instead of either sending Nav2 somewhere it
+        can provably never reach or dropping the location from the tour entirely.
+        """
+
+        if self.map_grid_ is None:
+            return None
+        if self.is_point_navigable(x, y, clearance_cells):
+            return x, y
+
+        samples_per_ring = 16
+        for ring in range(1, int(search_radius_m / self.map_resolution_) + 1):
+            radius_m = ring * self.map_resolution_
+            for sample in range(samples_per_ring):
+                angle = 2.0 * math.pi * sample / samples_per_ring
+                candidate_x = x + radius_m * math.cos(angle)
+                candidate_y = y + radius_m * math.sin(angle)
+                if self.is_point_navigable(candidate_x, candidate_y, clearance_cells):
+                    return candidate_x, candidate_y
+
+        return None
+
+    def compute_reachable_mask(self, robot_pose):
+        """
+        Advanced 2: boolean mask of cells the robot can actually drive to from where it is now,
+        through currently-known free space. Reuses Planning 1's wavefront BFS.
+
+        See cave_geometry.analyse_cave() for why the geometry analysis needs this rather than
+        just operating on every free cell on the map.
+        """
+
+        start = self.find_nearest_navigable_point(
+            robot_pose.x, robot_pose.y, clearance_cells=0, search_radius_m=1.0)
+        if start is None:
+            # The robot's own cell reads as occupied and nothing free is within a metre - almost
+            # certainly a transient SLAM artefact mid-update. Skip this cycle; the next tick's
+            # map will have moved on.
+            return None
+
+        row, col = self.world_to_grid(*start)
+        height, width = self.map_grid_.shape
+        if not (0 <= row < height and 0 <= col < width):
+            return None
+
+        return self.compute_path_distance_grid(row, col) >= 0
+
+    def update_cave_geometry(self):
+        """
+        Advanced 2: recompute the cave geometry analysis from the current map and publish it.
+
+        Runs on a timer throughout the mission (see GEOMETRY_UPDATE_PERIOD_S) rather than once
+        at the end, because the task asks for the distance transform to be computed and updated
+        online - so the widest-area and bottleneck answers visibly refine in RViz as SLAM
+        reveals more cave, instead of appearing all at once after the fact.
+        """
+
+        if self.map_grid_ is None or self.map_resolution_ is None:
+            return
+
+        # Checked rather than just calling get_pose_2d(), which logs an error on every failed
+        # lookup - this timer would otherwise spam the log until SLAM comes up.
+        if not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time()):
+            return
+        robot_pose = self.get_pose_2d()
+        if robot_pose is None:
+            return
+
+        # Snapshot the map parameters alongside the grid itself, so the published overlay is
+        # guaranteed to describe the same grid the analysis ran on even if a new map arrives
+        # before this method finishes.
+        grid = self.map_grid_
+        resolution = self.map_resolution_
+        origin = list(self.map_origin_)
+
+        reachable = self.compute_reachable_mask(robot_pose)
+        if reachable is None:
+            return
+
+        # max_features is higher than Advanced 2 needs on its own (which only has to report the
+        # widest area and a bottleneck): the science tour draws its stops from these same lists
+        # (see collect_science_locations()), so it needs enough candidates to fill a tour from.
+        self.geometry_ = cave_geometry.analyse_cave(grid, resolution, reachable, max_features=8)
+
+        self.publish_clearance_map(self.geometry_['clearance_m'], resolution, origin)
+        self.publish_geometry_markers(resolution, origin)
+        self.log_geometry_findings()
+
+    def log_geometry_findings(self):
+        """
+        Advanced 2: report the two headline findings the task asks for - the widest accessible
+        area and the narrowest passage.
+
+        Only logs when an answer actually changes by a noticeable amount, rather than every
+        GEOMETRY_UPDATE_PERIOD_S: during a long run the values settle early and repeating them
+        every few seconds would bury the exploration log, but the moment the robot breaks into a
+        bigger chamber or squeezes through a tighter gap is exactly what we want recorded.
+        """
+
+        min_change_m = 0.2
+        chambers = self.geometry_['chambers']
+        bottlenecks = self.geometry_['bottlenecks']
+
+        if chambers:
+            widest_m = chambers[0]['clearance_m']
+            if self.last_logged_widest_m_ is None \
+                    or abs(widest_m - self.last_logged_widest_m_) > min_change_m:
+                x, y = self.grid_to_world(chambers[0]['row'], chambers[0]['col'])
+                self.get_logger().info(
+                    f'    GEOMETRY: widest accessible area at ({x:.1f}, {y:.1f}) - '
+                    f'{2.0 * widest_m:.1f}m across ({len(chambers)} chambers found)')
+                self.last_logged_widest_m_ = widest_m
+
+        if bottlenecks:
+            narrowest_m = bottlenecks[0]['clearance_m']
+            if self.last_logged_narrowest_m_ is None \
+                    or abs(narrowest_m - self.last_logged_narrowest_m_) > min_change_m:
+                x, y = self.grid_to_world(bottlenecks[0]['row'], bottlenecks[0]['col'])
+                self.get_logger().info(
+                    f'    GEOMETRY: narrowest passage at ({x:.1f}, {y:.1f}) - '
+                    f"{bottlenecks[0]['width_m']:.1f}m wide ({len(bottlenecks)} bottlenecks found)")
+                self.last_logged_narrowest_m_ = narrowest_m
+
+    def publish_clearance_map(self, clearance_m, resolution, origin):
+        """
+        Advanced 2: republish the distance transform as an OccupancyGrid, so the task's "display
+        the distance transform" can be done with RViz's standard Map display rather than by
+        hand-rolling a per-cell marker grid (which would be tens of thousands of markers).
+
+        OccupancyGrid only carries 0-100 per cell, so clearance is scaled against
+        CLEARANCE_DISPLAY_MAX_M; walls and unexplored cells are published as -1 (unknown) so
+        they stay visually distinct from genuinely zero-clearance floor. Display it with RViz's
+        'costmap' colour scheme - the default 'map' scheme is a two-tone black/white ramp, which
+        can't show a gradient usefully.
+        """
+
+        height, width = clearance_m.shape
+
+        message = OccupancyGrid()
+        message.header.frame_id = 'map'
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.info.resolution = resolution
+        message.info.width = width
+        message.info.height = height
+        message.info.origin.position.x = origin[0]
+        message.info.origin.position.y = origin[1]
+        message.info.origin.orientation.w = 1.0
+
+        scaled = np.clip(clearance_m / CLEARANCE_DISPLAY_MAX_M * 100.0, 0.0, 100.0).astype(np.int8)
+        scaled[clearance_m <= 0.0] = -1  # not free space: wall or unexplored
+        message.data = scaled.ravel().tolist()
+
+        self.clearance_map_pub_.publish(message)
+
+    def publish_geometry_markers(self, resolution, origin):
+        """
+        Advanced 2: draw the detected chambers and bottlenecks in RViz, overlaid on the map.
+
+        Each feature is drawn as a flat disc of exactly the radius the clearance map says fits
+        there, so the marker isn't just a pin on a position - it's a direct visual claim about
+        the geometry ("this circle fits in this chamber") that can be checked by eye against the
+        map underneath it. The best of each kind (widest chamber, narrowest passage) is drawn
+        opaque and labelled with its size; the rest are faint, so the headline answers the task
+        asks for stand out from the supporting detections.
+        """
+
+        marker_array = MarkerArray()
+
+        # Clear everything first - the feature set shrinks as well as grows between updates (a
+        # chamber's local maximum can move a few cells, or a bottleneck can stop qualifying once
+        # the map fills in around it), and without this those stale markers would persist in
+        # RViz forever, accumulating into a misleading pile of "findings".
+        clear_all = Marker()
+        clear_all.header.frame_id = 'map'
+        clear_all.action = Marker.DELETEALL
+        marker_array.markers.append(clear_all)
+
+        def world_of(feature):
+            return (origin[0] + (feature['col'] + 0.5) * resolution,
+                    origin[1] + (feature['row'] + 0.5) * resolution)
+
+        for kind, features, color in (
+                ('chamber', self.geometry_['chambers'], (0.1, 0.9, 0.2)),
+                ('bottleneck', self.geometry_['bottlenecks'], (1.0, 0.2, 0.1))):
+            for index, feature in enumerate(features):
+                x, y = world_of(feature)
+                is_headline = (index == 0)
+
+                disc = Marker()
+                disc.header.frame_id = 'map'
+                disc.ns = f'cave_geometry_{kind}'
+                disc.id = index
+                disc.type = Marker.CYLINDER
+                disc.action = Marker.ADD
+                disc.pose.position = Point(x=x, y=y, z=0.05)
+                disc.pose.orientation.w = 1.0
+                # Diameter, not radius: clearance is the distance to the nearest wall, so the
+                # circle that actually fits is twice that across.
+                disc.scale.x = disc.scale.y = 2.0 * feature['clearance_m']
+                disc.scale.z = 0.05
+                disc.color.a = 0.55 if is_headline else 0.18
+                disc.color.r, disc.color.g, disc.color.b = color
+                marker_array.markers.append(disc)
+
+                if not is_headline:
+                    continue
+
+                label = Marker()
+                label.header.frame_id = 'map'
+                label.ns = f'cave_geometry_{kind}_label'
+                label.id = index
+                label.type = Marker.TEXT_VIEW_FACING
+                label.action = Marker.ADD
+                label.pose.position = Point(x=x, y=y, z=1.5)
+                label.pose.orientation.w = 1.0
+                label.scale.z = 0.8
+                label.color.a = 1.0
+                label.color.r, label.color.g, label.color.b = color
+                if kind == 'chamber':
+                    label.text = f"WIDEST AREA\n{2.0 * feature['clearance_m']:.1f}m across"
+                else:
+                    label.text = f"NARROWEST PASSAGE\n{feature['width_m']:.1f}m wide"
+                marker_array.markers.append(label)
+
+        self.geometry_markers_pub_.publish(marker_array)
+
+    #######################################################
+    # Advanced 5: science tour planning.
+    #
+    # The route optimisation itself lives in science_tour.py (pure python, no ROS) - see that
+    # module's docstring for the method. Everything here is the robot side of it: choosing which
+    # locations are worth visiting, measuring the real travel cost between them, driving the
+    # resulting route, and drawing it.
+
+    def find_artifact_viewpoint(self, position):
+        """
+        Advanced 5: a navigable point TOUR_ARTIFACT_STANDOFF_M from an artefact, or None.
+
+        Tries approach angles all the way around the artefact and takes the first that
+        validates, the same idea as planner_inspect_artifact()'s standoff search - an artefact
+        against a wall can only be viewed from some directions, and which ones isn't knowable
+        from its position alone.
+        """
+
+        for sample in range(8):
+            angle = 2.0 * math.pi * sample / 8
+            candidate = self.find_nearest_navigable_point(
+                position.x + TOUR_ARTIFACT_STANDOFF_M * math.cos(angle),
+                position.y + TOUR_ARTIFACT_STANDOFF_M * math.sin(angle),
+                search_radius_m=1.0)
+            if candidate is not None:
+                return candidate
+
+        return None
+
+    def collect_science_locations(self):
+        """
+        Advanced 5: choose the locations the tour will visit.
+
+        The task is explicit that the locations must be meaningful rather than arbitrary, so
+        every stop here is something the robot actually discovered and can justify:
+
+          * base (0, 0) - the lander. Always the first stop, so the tour is a closed loop that
+            starts and ends where a real mission would.
+          * confirmed artefacts - the science targets themselves, at a viewpoint standoff rather
+            than on top of them. Only ones confirmed by ARTIFACT_CONFIRMATION_OBSERVATIONS
+            observations, so a one-off false positive can't send the rover across the cave.
+          * chamber centres (Advanced 2) - the widest accessible areas, i.e. the candidate sites
+            for anything that needs room.
+          * bottlenecks (Advanced 2) - the narrow passages, the places a route plan has to care
+            about and worth re-surveying up close.
+
+        The three kinds are drawn against separate quotas instead of just taking the
+        highest-priority ones until full: a tour of nothing but artefact viewpoints would be a
+        worse survey than a mixed one, and it would also make the tour's content depend entirely
+        on how the perception run happened to go. Quotas are deliberately generous relative to
+        TOUR_MAX_LOCATIONS, with the shortfall topped up from whatever's left over, so the tour
+        still fills up when one category comes back thin.
+
+        Returns the list of stops (each a dict with x, y, label, kind), base first.
+        """
+
+        stops = []
+
+        def try_add(x, y, label, kind):
+            # No two stops at effectively the same place - a chamber centre and an artefact
+            # viewpoint inside that chamber can easily coincide, and the tour would then be
+            # "visiting" one spot twice while claiming two locations.
+            if any(math.hypot(x - stop['x'], y - stop['y']) < TOUR_MIN_STOP_SEPARATION_M
+                   for stop in stops):
+                return False
+            stops.append({'x': x, 'y': y, 'label': label, 'kind': kind, 'status': 'pending'})
+            return True
+
+        try_add(0.0, 0.0, 'base', 'base')
+
+        artifact_candidates = []
+        for cluster in self.artifact_clusters_:
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue
+            viewpoint = self.find_artifact_viewpoint(cluster['position'])
+            if viewpoint is not None:
+                artifact_candidates.append(
+                    (viewpoint[0], viewpoint[1], f"{cluster['label']} #{cluster['id']}", 'artifact'))
+
+        chamber_candidates = []
+        bottleneck_candidates = []
+        if self.geometry_ is not None:
+            for chamber in self.geometry_['chambers']:
+                x, y = self.grid_to_world(chamber['row'], chamber['col'])
+                navigable = self.find_nearest_navigable_point(x, y)
+                if navigable is not None:
+                    chamber_candidates.append(
+                        (navigable[0], navigable[1],
+                         f"chamber {2.0 * chamber['clearance_m']:.1f}m", 'chamber'))
+            for bottleneck in self.geometry_['bottlenecks']:
+                x, y = self.grid_to_world(bottleneck['row'], bottleneck['col'])
+                navigable = self.find_nearest_navigable_point(x, y, clearance_cells=2)
+                if navigable is not None:
+                    bottleneck_candidates.append(
+                        (navigable[0], navigable[1],
+                         f"passage {bottleneck['width_m']:.1f}m", 'bottleneck'))
+
+        quotas = ((artifact_candidates, 6), (chamber_candidates, 4), (bottleneck_candidates, 3))
+        for candidates, quota in quotas:
+            added = 0
+            for x, y, label, kind in candidates:
+                if added >= quota or len(stops) >= TOUR_MAX_LOCATIONS:
+                    break
+                if try_add(x, y, label, kind):
+                    added += 1
+
+        # Top up from everything left over if the quotas didn't fill the tour.
+        for candidates, _ in quotas:
+            for x, y, label, kind in candidates:
+                if len(stops) >= TOUR_MAX_LOCATIONS:
+                    break
+                try_add(x, y, label, kind)
+
+        return stops
+
+    def build_tour_cost_matrix(self, stops):
+        """
+        Advanced 5: travel cost between every pair of stops, in metres of actual driving.
+
+        Each entry comes from Planning 1's wavefront BFS over the occupancy grid - one full-map
+        BFS per stop, reading off the distance to all the others. This is the part of Advanced 5
+        the task is most specific about: the cost has to come from the navigation map, not from
+        straight-line distance. In a branching cave those are wildly different numbers. Two
+        chambers either side of a single wall are metres apart as the crow flies and can be fifty
+        metres apart by road, and a tour optimised on straight-line distance would confidently
+        order its stops as though the rover could drive through rock - producing a route that is
+        provably optimal for a problem the robot doesn't have.
+
+        Unreachable pairs are marked -1 rather than a large number, so the route optimisation can
+        tell "far away" apart from "no route at all" and refuse to plan through the latter.
+        """
+
+        count = len(stops)
+        cost_matrix = [[0.0] * count for _ in range(count)]
+        height, width = self.map_grid_.shape
+
+        for i, stop in enumerate(stops):
+            row, col = self.world_to_grid(stop['x'], stop['y'])
+            distance_grid = self.compute_path_distance_grid(row, col)
+
+            for j, other in enumerate(stops):
+                if i == j:
+                    continue
+                other_row, other_col = self.world_to_grid(other['x'], other['y'])
+                if not (0 <= other_row < height and 0 <= other_col < width):
+                    cost_matrix[i][j] = -1.0
+                    continue
+                cells = distance_grid[other_row, other_col]
+                cost_matrix[i][j] = float(cells) * self.map_resolution_ if cells >= 0 else -1.0
+
+        return cost_matrix
+
+    def plan_science_tour(self):
+        """
+        Advanced 5: pick the locations, measure the real travel costs, and optimise the route.
+
+        Returns True if a tour was planned. Stops with no route to or from base are dropped
+        before optimising - keeping one would make the whole tour cost meaningless (and send the
+        rover off to burn a goal timeout proving Nav2 can't get there either).
+        """
+
+        if self.map_grid_ is None:
+            return False
+
+        stops = self.collect_science_locations()
+        if len(stops) < TOUR_MIN_LOCATIONS:
+            self.get_logger().warn(
+                f'    SCIENCE TOUR: only found {len(stops)} distinct reachable locations, '
+                f'need {TOUR_MIN_LOCATIONS} - skipping the tour')
+            return False
+
+        plan_start = self.get_clock().now()
+        cost_matrix = self.build_tour_cost_matrix(stops)
+
+        # Drop anything with no route to or from base (index 0), then rebuild the matrix over
+        # what's left - simpler and less error-prone than trying to delete rows and columns.
+        connected = [0] + [i for i in range(1, len(stops))
+                           if cost_matrix[0][i] >= 0.0 and cost_matrix[i][0] >= 0.0]
+        if len(connected) < len(stops):
+            dropped = len(stops) - len(connected)
+            self.get_logger().warn(
+                f'    SCIENCE TOUR: dropped {dropped} location(s) with no route to base')
+            stops = [stops[i] for i in connected]
+            if len(stops) < TOUR_MIN_LOCATIONS:
+                self.get_logger().warn(
+                    f'    SCIENCE TOUR: only {len(stops)} locations left after dropping '
+                    f'unreachable ones - skipping the tour')
+                return False
+            cost_matrix = self.build_tour_cost_matrix(stops)
+
+        result = science_tour.plan_tour(cost_matrix, start=0)
+        plan_s = (self.get_clock().now() - plan_start).nanoseconds / 1e9
+
+        self.tour_ = {'stops': stops, 'cost_matrix': cost_matrix, **result}
+        self.tour_stop_index_ = 0
+
+        self.log_tour_plan(plan_s)
+        self.publish_tour_markers()
+        return True
+
+    def log_tour_plan(self, plan_s):
+        """
+        Advanced 5: print the planned tour and the baseline-vs-optimised comparison the task
+        asks for, in a form that can go straight into the report.
+        """
+
+        tour = self.tour_
+        self.get_logger().info('-' * 54)
+        self.get_logger().info(
+            f"SCIENCE TOUR PLANNED: {len(tour['stops'])} locations in {plan_s:.1f}s")
+        self.get_logger().info(
+            f"    baseline  (nearest neighbour): {tour['baseline_cost_m']:.1f}m")
+        self.get_logger().info(
+            f"    optimised (2-opt)            : {tour['optimised_cost_m']:.1f}m")
+        self.get_logger().info(
+            f"    saving: {tour['saved_m']:.1f}m ({tour['saved_percent']:.1f}%)")
+        self.get_logger().info('    route:')
+        for position, stop_index in enumerate(tour['optimised_order']):
+            stop = tour['stops'][stop_index]
+            self.get_logger().info(
+                f"      {position + 1:2d}. {stop['label']:<24} "
+                f"({stop['x']:6.1f}, {stop['y']:6.1f})  [{stop['kind']}]")
+
+    def publish_tour_markers(self):
+        """
+        Advanced 5: draw the tour in RViz - the stops, and both routes through them.
+
+        Both tours are drawn, not just the chosen one: the whole point of the task is the
+        comparison, and seeing the baseline's long cross-cave backtrack next to the optimised
+        loop makes the saving obvious at a glance in a way a pair of numbers in a log doesn't.
+        The baseline is drawn faint and lower, the optimised route bright and above it.
+
+        The lines are straight between consecutive stops, i.e. a diagram of the visiting ORDER,
+        not of the path the robot drives (which follows the cave's corridors - Nav2 plans that).
+        The costs that produced this order are the real path distances, though; see
+        build_tour_cost_matrix().
+        """
+
+        if self.tour_ is None:
+            return
+
+        marker_array = MarkerArray()
+        clear_all = Marker()
+        clear_all.header.frame_id = 'map'
+        clear_all.action = Marker.DELETEALL
+        marker_array.markers.append(clear_all)
+
+        stops = self.tour_['stops']
+        status_colors = {'pending': (1.0, 1.0, 0.0), 'visited': (0.0, 1.0, 0.0),
+                         'missed': (1.0, 0.4, 0.0)}
+
+        for position, stop_index in enumerate(self.tour_['optimised_order']):
+            stop = stops[stop_index]
+            color = status_colors.get(stop['status'], (1.0, 1.0, 1.0))
+
+            sphere = Marker()
+            sphere.header.frame_id = 'map'
+            sphere.ns = 'science_tour_stops'
+            sphere.id = position
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position = Point(x=stop['x'], y=stop['y'], z=0.4)
+            sphere.pose.orientation.w = 1.0
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.7
+            sphere.color.a = 1.0
+            sphere.color.r, sphere.color.g, sphere.color.b = color
+            marker_array.markers.append(sphere)
+
+            label = Marker()
+            label.header.frame_id = 'map'
+            label.ns = 'science_tour_labels'
+            label.id = position
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position = Point(x=stop['x'], y=stop['y'], z=1.2)
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.6
+            label.color.a = 1.0
+            label.color.r, label.color.g, label.color.b = color
+            label.text = f"{position + 1}. {stop['label']}"
+            marker_array.markers.append(label)
+
+        for namespace, order, color, alpha, z, thickness in (
+                ('science_tour_baseline', self.tour_['baseline_order'], (0.6, 0.6, 0.6), 0.5, 0.15, 0.08),
+                ('science_tour_optimised', self.tour_['optimised_order'], (0.0, 0.9, 1.0), 1.0, 0.35, 0.15)):
+            line = Marker()
+            line.header.frame_id = 'map'
+            line.ns = namespace
+            line.id = 0
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.pose.orientation.w = 1.0
+            line.scale.x = thickness
+            line.color.a = alpha
+            line.color.r, line.color.g, line.color.b = color
+            # The closing leg back to the first stop is included, because the tour is a closed
+            # loop - the rover has to get home - and that leg is part of the cost being compared.
+            for stop_index in list(order) + [order[0]]:
+                stop = stops[stop_index]
+                line.points.append(Point(x=stop['x'], y=stop['y'], z=z))
+            marker_array.markers.append(line)
+
+        self.tour_markers_pub_.publish(marker_array)
+
+    def planner_science_tour(self):
+        """Advanced 5: drive to the current stop on the optimised tour."""
+
+        order = self.tour_['optimised_order']
+        stop = self.tour_['stops'][order[self.tour_stop_index_]]
+
+        # Face the next stop on arrival, so the rover is already pointed the right way for the
+        # following leg (and, at a science stop, is looking across the area rather than at a wall).
+        next_stop = self.tour_['stops'][order[(self.tour_stop_index_ + 1) % len(order)]]
+        theta = math.atan2(next_stop['y'] - stop['y'], next_stop['x'] - stop['x'])
+
+        self.get_logger().info(
+            f"    stop {self.tour_stop_index_ + 1}/{len(order)}: {stop['label']}")
+        self.planner_go_to_pose2d(Pose2D(x=stop['x'], y=stop['y'], theta=theta))
+
+    def advance_science_tour(self):
+        """
+        Advanced 5: the goal for the current tour stop just finished - record it and move on.
+
+        A stop that failed is recorded as missed and the tour continues to the next one rather
+        than retrying: by this point the route is already planned and the remaining stops are
+        all still worth visiting, so spending retries (and goal timeouts) on one awkward
+        viewpoint at the cost of the rest of the tour is the wrong trade. The missed stop stays
+        visible in RViz as an orange marker, so it's reported rather than quietly dropped.
+        """
+
+        order = self.tour_['optimised_order']
+        stop = self.tour_['stops'][order[self.tour_stop_index_]]
+
+        if self.goal_cancelled_by_pause_:
+            # Not a real failure - the goal was cancelled by a pause (see
+            # pause_mission_callback()). Leave the index alone so this same stop is re-sent.
+            self.goal_cancelled_by_pause_ = False
+            self.get_logger().info(f"    (resuming tour stop '{stop['label']}' after pause)")
+            return
+
+        if self.last_goal_succeeded_:
+            stop['status'] = 'visited'
+            self.get_logger().info(f"    DONE: reached tour stop '{stop['label']}'")
+        else:
+            stop['status'] = 'missed'
+            self.get_logger().warn(f"    MISSED: tour stop '{stop['label']}' not reached")
+
+        self.tour_stop_index_ += 1
+        if self.tour_stop_index_ >= len(order):
+            visited = sum(1 for s in self.tour_['stops'] if s['status'] == 'visited')
+            self.get_logger().info(
+                f"    SCIENCE TOUR COMPLETE: {visited}/{len(order)} stops reached, "
+                f"planned route {self.tour_['optimised_cost_m']:.1f}m "
+                f"(vs {self.tour_['baseline_cost_m']:.1f}m baseline)")
+            self.tour_complete_ = True
+            self.tour_requested_ = False
+
+        self.publish_tour_markers()
+
+    def should_run_science_tour(self):
+        """
+        Advanced 5: whether the tour should be the active behaviour.
+
+        Either exploration has finished (the natural trigger - the cave is mapped, so now go
+        back round everything worth a second look) or the tour was explicitly requested via the
+        start_science_tour service.
+        """
+
+        if self.tour_complete_ or self.tour_planning_failed_:
+            return False
+        if self.tour_requested_:
+            return True
+
+        return (self.exploration_complete_
+                and self.get_parameter('science_tour_on_completion').value)
+
+    def ensure_science_tour_planned(self):
+        """
+        Advanced 5: plan the tour if it hasn't been planned yet. Returns True if there's a tour
+        to execute.
+
+        On failure this latches tour_planning_failed_ so planning isn't retried on every tick
+        for the rest of the mission - the usual cause is simply not enough distinct reachable
+        locations having been found, which won't change once exploration is over.
+        """
+
+        if self.tour_ is not None:
+            return True
+
+        if not self.plan_science_tour():
+            self.tour_planning_failed_ = True
+            return False
+
+        return True
+
+    def start_science_tour_callback(self, request, response):
+        """
+        Advanced 5: service to run the science tour now, instead of waiting for exploration to
+        finish on its own. Mainly for demos - the tour is the end-of-mission behaviour, and a
+        full cave takes a while to explore.
+
+        The tour is planned from whatever has been discovered so far, so an early call may find
+        too few locations to plan one (reported back in the response rather than failing
+        silently). Exploration resumes normally once the tour finishes.
+        """
+
+        if not self.mission_started_:
+            response.success = False
+            response.message = 'Mission not started yet'
+            return response
+        if self.tour_complete_:
+            response.success = False
+            response.message = 'Science tour already completed'
+            return response
+        if self.tour_requested_:
+            response.success = False
+            response.message = 'Science tour already running'
+            return response
+
+        self.tour_requested_ = True
+        # Planning happens in main_loop (it needs a couple of seconds of whole-map BFS, which
+        # shouldn't run inside a service callback), so clear the failure latch in case an
+        # earlier attempt gave up when less of the cave had been mapped.
+        self.tour_planning_failed_ = False
+        if self.current_goal_handle_ is not None:
+            self.current_goal_handle_.cancel_goal_async()
+
+        self.get_logger().info('Science tour requested')
+        response.success = True
+        response.message = 'Science tour starting'
+        return response
+
+    #######################################################
+
     def main_loop(self):
         """
         Set the next goal pose and send to the action server
@@ -1968,6 +2752,9 @@ class CaveExplorer(Node):
                     self.inspection_target_ = None
                     self.inspection_attempts_ = 0
                 # else: inspection_target_ stays set, so it's retried below
+        elif self.planner_type_ == PlannerType.SCIENCE_TOUR:
+            # Advanced 5: the goal for the current tour stop just finished
+            self.advance_science_tour()
         elif self.planner_type_ == PlannerType.RETURN_HOME:
             # The "go home" goal just finished (either way) - re-check for any artefact
             # confirmed too late to trigger the en-route preemption above (e.g. confirmed in
@@ -2000,6 +2787,13 @@ class CaveExplorer(Node):
 
         if self.inspection_target_ is not None:
             self.planner_type_ = PlannerType.INSPECT_ARTIFACT
+        elif self.should_run_science_tour() and self.ensure_science_tour_planned():
+            # Advanced 5: revisit the science locations on an optimised route. Sits between
+            # inspection and return-home: a pending artefact is still inspected first (it's a
+            # new discovery, and it also becomes a candidate tour stop once confirmed), but the
+            # tour happens before the robot commits to going home and stopping. If no tour can
+            # be planned, this falls through to the normal end-of-mission behaviour below.
+            self.planner_type_ = PlannerType.SCIENCE_TOUR
         elif self.exploration_complete_:
             # Nothing left to explore and nothing left to inspect - head home and stop
             self.planner_type_ = PlannerType.RETURN_HOME
@@ -2024,6 +2818,8 @@ class CaveExplorer(Node):
             self.planner_explore_frontier()
         elif self.planner_type_ == PlannerType.INSPECT_ARTIFACT:
             self.planner_inspect_artifact()
+        elif self.planner_type_ == PlannerType.SCIENCE_TOUR:
+            self.planner_science_tour()
         else:
             self.get_logger().error('No valid planner selected')
             self.destroy_node()
