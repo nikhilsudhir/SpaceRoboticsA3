@@ -583,6 +583,17 @@ GOAL_TIMEOUT_S = 45.0
 # corridors, and the occasional recovery cycle without falsely running out of patience.
 RETURN_HOME_MIN_SPEED_MPS = 0.3
 
+# Advanced 5 robustness: the same idea for science tour legs - see planner_science_tour(). Tour
+# legs are the longest goals the mission ever sends: the route is a closed loop over the whole
+# explored cave, so a leg routinely spans 20-40m (the first leg is worst, since the tour starts
+# from wherever exploration happened to leave the rover and stop 1 is base). The flat
+# GOAL_TIMEOUT_S ceiling cancelled every single stop in live testing - 36m to base abandoned at
+# 46s, then four more at 42-44s, 0 of 12 stops reached - because 36m in 45s needs 0.8m/s
+# sustained with no turning. Same conservative figure as RETURN_HOME_MIN_SPEED_MPS, kept as its
+# own constant because the two behaviours are tuned for different reasons and shouldn't drift
+# together by accident.
+TOUR_MIN_SPEED_MPS = 0.3
+
 # Planning 1/3 robustness: a companion to GOAL_TIMEOUT_S that reacts to Nav2's own
 # distance_remaining feedback (see feedback_callback()) rather than waiting out a flat
 # duration regardless of whether the robot is actually making progress. If distance_remaining
@@ -2835,7 +2846,15 @@ class CaveExplorer(Node):
         self.tour_markers_pub_.publish(marker_array)
 
     def planner_science_tour(self):
-        """Advanced 5: drive to the current stop on the optimised tour."""
+        """
+        Advanced 5: drive to the current stop on the optimised tour.
+
+        Uses a distance-scaled timeout (see TOUR_MIN_SPEED_MPS) instead of the flat
+        GOAL_TIMEOUT_S, for the same reason planner_return_home() does: a tour leg crosses the
+        explored cave, so the flat ceiling expires mid-leg and the stop is recorded as missed
+        even though Nav2 was driving it correctly. Live testing with the flat ceiling reached 0
+        of 12 stops, every one cancelled at 42-46s.
+        """
 
         order = self.tour_['optimised_order']
         stop = self.tour_['stops'][order[self.tour_stop_index_]]
@@ -2845,9 +2864,21 @@ class CaveExplorer(Node):
         next_stop = self.tour_['stops'][order[(self.tour_stop_index_ + 1) % len(order)]]
         theta = math.atan2(next_stop['y'] - stop['y'], next_stop['x'] - stop['x'])
 
+        # Scale off the straight-line distance the rover actually has to cover from where it is
+        # now, not the planned leg length: the tour's first leg starts from wherever exploration
+        # left the rover, which is nowhere near the stop the route has it leaving from.
+        robot_pose = self.get_pose_2d()
+        if robot_pose is not None:
+            leg_distance_m = math.hypot(stop['x'] - robot_pose.x, stop['y'] - robot_pose.y)
+            timeout_s = max(GOAL_TIMEOUT_S, leg_distance_m / TOUR_MIN_SPEED_MPS)
+        else:
+            timeout_s = GOAL_TIMEOUT_S
+
         self.get_logger().info(
-            f"    stop {self.tour_stop_index_ + 1}/{len(order)}: {stop['label']}")
-        self.planner_go_to_pose2d(Pose2D(x=stop['x'], y=stop['y'], theta=theta))
+            f"    stop {self.tour_stop_index_ + 1}/{len(order)}: {stop['label']} "
+            f"(timeout {timeout_s:.0f}s)")
+        self.planner_go_to_pose2d(Pose2D(x=stop['x'], y=stop['y'], theta=theta),
+                                  timeout_s=timeout_s)
 
     def advance_science_tour(self):
         """
@@ -3027,6 +3058,14 @@ class CaveExplorer(Node):
         # distance to the goal - see goal_target_x_'s comment for why that, and not Nav2's
         # distance_remaining feedback, is what's tracked.
         #
+        # The progress-based trigger is skipped for SCIENCE_TOUR for the same reason it's skipped
+        # for RETURN_HOME, one step worse: a tour leg is the longest goal the mission sends, so
+        # straight-line distance to the stop plateaus for long stretches while the rover rounds a
+        # chamber or backtracks out of a dead end, and every one of those reads as a stall. With
+        # both this check and the flat ceiling applying, live testing reached 0 of 12 tour stops.
+        # SCIENCE_TOUR now sends a distance-scaled ceiling too (see planner_science_tour()), which
+        # still bounds a genuinely stuck stop - it's recorded as missed and the tour moves on.
+        #
         # The progress-based trigger is skipped for RETURN_HOME specifically: live testing hit
         # it firing twice in a row on the final return trip, genuinely stranding the robot ~14m
         # short of base once goal cancellation actually started working (see
@@ -3054,7 +3093,8 @@ class CaveExplorer(Node):
                 if self.goal_progress_time_ is not None else 0.0
             if elapsed_s > self.goal_timeout_s_:
                 self.abandon_current_goal('timed out')
-            elif self.planner_type_ != PlannerType.RETURN_HOME and stalled_s > GOAL_PROGRESS_STALL_S:
+            elif self.planner_type_ not in (PlannerType.RETURN_HOME, PlannerType.SCIENCE_TOUR) \
+                    and stalled_s > GOAL_PROGRESS_STALL_S:
                 self.abandon_current_goal('no progress')
 
         # Check if previous goal still running
