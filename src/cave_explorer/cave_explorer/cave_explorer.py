@@ -494,8 +494,52 @@ EXPLORATION_COMPLETE_STREAK = 5
 # to be confused with each other, so are left out).
 INSPECTION_ARTIFACT_LABELS = ['mushroom_blue', 'white_sphere', 'green_crystals']
 
-# Planning 2: distance (metres) to stop from an artefact for close-range inspection.
+# Planning 2: distance (metres) to stop from an artefact for close-range inspection. A floor
+# rather than the final figure - see artifact_standoff_distance(), which pushes it out for
+# artefact types whose own body is wider than this.
 INSPECTION_STANDOFF_DISTANCE_M = 2.0
+
+# Physical radius (metres) of each artefact type: half the larger horizontal extent of the
+# model's mesh bounding box, i.e. the mesh's own bbox times the <scale> it's placed with in
+# mars_cave.sdf. How far the solid object actually reaches from the point perception reports.
+#
+# Needed because standoff distances are measured from the artefact's detected centroid, and two
+# of the models are wider than the 2.0m standoff above: the green crystal clusters and the ice
+# formations are both roughly 4.5 x 5.2m, so their spikes reach ~2.6m from their own centre. A
+# 2.0m standoff puts the goal INSIDE the model.
+#
+# The map can't be relied on to catch that. The lidar is a single horizontal ray at z = 1.0m
+# (scan_joint in mars_explorer.urdf.xacro) and both of those models are clusters of thin spikes
+# at that height, so most rays pass between the spikes and clear the cells behind them - the
+# artefact ends up barely present in the occupancy grid, a few scattered occupied cells with
+# apparently free space between them. is_point_navigable() then quite correctly reports a point
+# inside the model as free, Nav2 plans straight through it, and the rover wedges against the
+# collision mesh, which is the full dense mesh rather than the thin cross-section the lidar saw.
+# Seen live as the rover sitting inside a green crystal cluster with its wheels still turning.
+#
+# So this trusts perception rather than the map: we know a solid object is at that position
+# because we just detected it there, and we know how big that type of object is, which is enough
+# to keep goals out of it without needing the lidar to agree.
+ARTIFACT_PHYSICAL_RADIUS_M = {
+    'green_crystals': 2.6,
+    'ice_formation': 2.6,
+    'green_alien': 1.2,
+    'mushroom_blue': 1.2,
+    'white_sphere': 0.8,
+}
+
+# Used for any label not in the table above, so a new profile added to ARTIFACT_COLOR_PROFILES
+# gets sensible-but-cautious treatment rather than silently defaulting to zero clearance.
+ARTIFACT_DEFAULT_PHYSICAL_RADIUS_M = 1.3
+
+# Half the diagonal of base_link's 1x1m collision box (see mars_explorer.urdf.xacro, and the
+# matching explicit footprint in nav2_params.yaml): the distance from the rover's centre to its
+# furthest corner, i.e. how much room its own body needs around a goal point.
+ROVER_FOOTPRINT_RADIUS_M = 0.71
+
+# Extra breathing room (metres) on top of artefact radius + rover radius, so a viewpoint is
+# comfortably outside the artefact rather than exactly touching it.
+ARTIFACT_STANDOFF_MARGIN_M = 0.4
 
 # Planning 3: if a close-range inspection goal doesn't succeed (Nav2 aborts/rejects it - e.g.
 # the artefact's standoff point turned out to be unreachable), retry it this many times before
@@ -591,10 +635,12 @@ GEOMETRY_FEATURE_SEPARATION_M = 4.0
 TOUR_MIN_LOCATIONS = 8
 TOUR_MAX_LOCATIONS = 12
 
-# Advanced 5: how far (metres) from an artefact the tour stops, so a science stop is a viewpoint
-# of the artefact rather than a point inside it (the artefact itself is an obstacle in the map).
-# Matches the Planning 2 inspection standoff for consistency between the two behaviours.
-TOUR_ARTIFACT_STANDOFF_M = INSPECTION_STANDOFF_DISTANCE_M
+# Advanced 5: how far from an artefact the tour stops - so a science stop is a viewpoint of the
+# artefact rather than a point inside it - comes from artifact_standoff_distance(), shared with
+# the Planning 2 inspection standoff for consistency between the two behaviours. It's per-label
+# rather than a single constant because the artefact's own size decides it; an earlier single
+# constant here assumed the artefact would show up in the map as an obstacle to plan around,
+# which turned out not to hold (see ARTIFACT_PHYSICAL_RADIUS_M).
 
 # Advanced 5: two tour stops closer together than this (metres) are treated as the same place
 # and only one is kept - see collect_science_locations(). Smaller than
@@ -1461,6 +1507,47 @@ class CaveExplorer(Node):
         patch = self.map_grid_[row_lo:row_hi, col_lo:col_hi]
         return bool(np.all((patch >= 0) & (patch < FRONTIER_OCCUPIED_THRESHOLD)))
 
+    def artifact_standoff_distance(self, label):
+        """
+        How far from an artefact's detected centroid a viewpoint has to be to stay clear of the
+        artefact's own body: its physical radius (see ARTIFACT_PHYSICAL_RADIUS_M) plus the
+        rover's, plus a small margin.
+
+        Floored at INSPECTION_STANDOFF_DISTANCE_M so small artefacts are still inspected from
+        genuinely close range - this only pushes the viewpoint out for the types that need it,
+        rather than backing away from everything to satisfy the widest model in the world.
+        """
+
+        radius = ARTIFACT_PHYSICAL_RADIUS_M.get(label, ARTIFACT_DEFAULT_PHYSICAL_RADIUS_M)
+        return max(INSPECTION_STANDOFF_DISTANCE_M,
+                   radius + ROVER_FOOTPRINT_RADIUS_M + ARTIFACT_STANDOFF_MARGIN_M)
+
+    def is_clear_of_artifacts(self, x, y):
+        """
+        Is (x, y) outside the physical body of every artefact we currently know about?
+
+        Checks all of them rather than just whichever one we're heading to, because the
+        artefacts in this world are often placed in pairs a metre or two apart (a green alien
+        standing right beside a crystal cluster, for instance - detected live at (7.9, 3.7) and
+        (7.6, 4.3)). A perfectly good standoff point for one can therefore sit inside its
+        neighbour, and the same applies to the map-derived tour stops, where a 'narrow passage'
+        can turn out to be a gap between two spikes of the same crystal cluster.
+
+        Only confirmed clusters count. An unconfirmed detection could still be a one-off false
+        positive, and letting those veto goals would let a bad frame block off real space.
+        """
+
+        for cluster in self.artifact_clusters_:
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue
+            radius = ARTIFACT_PHYSICAL_RADIUS_M.get(
+                cluster['label'], ARTIFACT_DEFAULT_PHYSICAL_RADIUS_M)
+            dx = x - cluster['position'].x
+            dy = y - cluster['position'].y
+            if math.hypot(dx, dy) < radius + ROVER_FOOTPRINT_RADIUS_M:
+                return False
+        return True
+
     def find_frontier_cells(self):
         """
         Planning 1: return a boolean mask of 'frontier' cells - free cells that neighbour at
@@ -1797,12 +1884,18 @@ class CaveExplorer(Node):
         Tries a handful of candidate approach angles around the artefact, starting with
         approaching from the robot's current side (shortest path) and otherwise spaced around
         it, using the first one that validates as (a) free space in the current map (see
-        is_point_navigable()) AND (b) actually reachable from the robot's current position
-        through currently-known free space (reusing the same BFS path-distance grid frontier
-        selection uses - see compute_path_distance_grid()). A standoff point computed from the
+        is_point_navigable()), (b) actually reachable from the robot's current position through
+        currently-known free space (reusing the same BFS path-distance grid frontier selection
+        uses - see compute_path_distance_grid()), and (c) outside the physical body of every
+        known artefact (see is_clear_of_artifacts()). A standoff point computed from the
         artefact's position alone can otherwise land inside a wall, in unexplored space, or on
         the far side of a wall with no known connecting path - which Nav2's global planner then
         can't find a path to at all, rather than just navigating there poorly.
+
+        Check (c) exists because (a) alone isn't sufficient: the widest artefacts are wider than
+        the nominal standoff distance, and they show up so sparsely in the lidar's single
+        horizontal scan plane that the map reports the inside of them as free space. See
+        ARTIFACT_PHYSICAL_RADIUS_M for the full explanation.
         """
 
         robot_pose = self.get_pose_2d()
@@ -1828,13 +1921,25 @@ class CaveExplorer(Node):
 
         candidate_offsets = [0.0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2,
                              3 * math.pi / 4, -3 * math.pi / 4, math.pi]
+        standoff = self.artifact_standoff_distance(self.inspection_target_['label'])
+
+        # Try the nominal standoff first, then step outwards. The nominal distance already clears
+        # the artefact's own body, but an artefact sitting against a wall or beside a second
+        # artefact can have every angle at that exact radius blocked while a slightly wider orbit
+        # is completely clear. Stepping out is much better than the unvalidated fallback below.
         goal_x = goal_y = None
-        for offset in candidate_offsets:
-            angle = base_angle + offset
-            candidate_x = target.x + math.cos(angle) * INSPECTION_STANDOFF_DISTANCE_M
-            candidate_y = target.y + math.sin(angle) * INSPECTION_STANDOFF_DISTANCE_M
-            if self.is_point_navigable(candidate_x, candidate_y) and is_reachable(candidate_x, candidate_y):
-                goal_x, goal_y = candidate_x, candidate_y
+        for extra_distance in (0.0, 1.0, 2.0):
+            for offset in candidate_offsets:
+                angle = base_angle + offset
+                distance = standoff + extra_distance
+                candidate_x = target.x + math.cos(angle) * distance
+                candidate_y = target.y + math.sin(angle) * distance
+                if self.is_point_navigable(candidate_x, candidate_y) \
+                        and is_reachable(candidate_x, candidate_y) \
+                        and self.is_clear_of_artifacts(candidate_x, candidate_y):
+                    goal_x, goal_y = candidate_x, candidate_y
+                    break
+            if goal_x is not None:
                 break
 
         if goal_x is None:
@@ -1845,8 +1950,10 @@ class CaveExplorer(Node):
             self.get_logger().warn(
                 f"    (no validated standoff point for {self.inspection_target_['label']} "
                 f"#{self.inspection_target_['id']} - falling back to unvalidated direct approach)")
-            goal_x = target.x + math.cos(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
-            goal_y = target.y + math.sin(base_angle) * INSPECTION_STANDOFF_DISTANCE_M
+            # Still use the label's own standoff distance, not the 2.0m floor: even unvalidated,
+            # a goal outside the artefact's body is far better than one inside it.
+            goal_x = target.x + math.cos(base_angle) * standoff
+            goal_y = target.y + math.sin(base_angle) * standoff
 
         theta = math.atan2(target.y - goal_y, target.x - goal_x)  # face the artefact
         self.planner_go_to_pose2d(Pose2D(x=goal_x, y=goal_y, theta=theta))
@@ -2389,24 +2496,43 @@ class CaveExplorer(Node):
     # locations are worth visiting, measuring the real travel cost between them, driving the
     # resulting route, and drawing it.
 
-    def find_artifact_viewpoint(self, position):
+    def find_artifact_viewpoint(self, position, label=None):
         """
-        Advanced 5: a navigable point TOUR_ARTIFACT_STANDOFF_M from an artefact, or None.
+        Advanced 5: a navigable point a standoff distance from an artefact, or None.
 
         Tries approach angles all the way around the artefact and takes the first that
         validates, the same idea as planner_inspect_artifact()'s standoff search - an artefact
         against a wall can only be viewed from some directions, and which ones isn't knowable
         from its position alone.
+
+        The standoff comes from artifact_standoff_distance(label) so a tour stop lands outside
+        the artefact's own body rather than inside the wider models, and every candidate is
+        checked against is_clear_of_artifacts() afterwards: find_nearest_navigable_point()
+        searches outwards from the requested point for free space, and since the inside of a
+        crystal cluster reads as free in the map, snapping could otherwise pull the viewpoint
+        back into the artefact it was supposed to stand off from.
+
+        Orbits outwards if nothing at the nominal distance works, the same ladder as
+        planner_inspect_artifact(). Needed for exactly the same reason: a small artefact right
+        beside a big one has its entire nominal standoff ring inside the big one's body. The
+        green alien and the crystal cluster were detected 0.67m apart, and the crystal reaches
+        3.31m once the rover's own width is counted, which swallows the whole 2.31m ring around
+        the alien - without the ladder that artefact is simply dropped from the tour, losing a
+        real science stop to a viewpoint that does exist a little further out.
         """
 
-        for sample in range(8):
-            angle = 2.0 * math.pi * sample / 8
-            candidate = self.find_nearest_navigable_point(
-                position.x + TOUR_ARTIFACT_STANDOFF_M * math.cos(angle),
-                position.y + TOUR_ARTIFACT_STANDOFF_M * math.sin(angle),
-                search_radius_m=1.0)
-            if candidate is not None:
-                return candidate
+        standoff = self.artifact_standoff_distance(label)
+        for extra_distance in (0.0, 1.0, 2.0):
+            distance = standoff + extra_distance
+            for sample in range(8):
+                angle = 2.0 * math.pi * sample / 8
+                candidate = self.find_nearest_navigable_point(
+                    position.x + distance * math.cos(angle),
+                    position.y + distance * math.sin(angle),
+                    search_radius_m=1.0)
+                if candidate is not None \
+                        and self.is_clear_of_artifacts(candidate[0], candidate[1]):
+                    return candidate
 
         return None
 
@@ -2455,25 +2581,32 @@ class CaveExplorer(Node):
         for cluster in self.artifact_clusters_:
             if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
                 continue
-            viewpoint = self.find_artifact_viewpoint(cluster['position'])
+            viewpoint = self.find_artifact_viewpoint(cluster['position'], cluster['label'])
             if viewpoint is not None:
                 artifact_candidates.append(
                     (viewpoint[0], viewpoint[1], f"{cluster['label']} #{cluster['id']}", 'artifact'))
 
+        # Geometry features are filtered through is_clear_of_artifacts() as well. Advanced 2
+        # describes the map honestly, but the map isn't the world: a cluster of crystal spikes
+        # reads as a scatter of isolated obstacles in the lidar's single scan plane, so the gaps
+        # between the spikes get reported as perfectly genuine narrow passages. One such "passage
+        # 0.6m" was logged at (7.0, 5.7), a metre and a half from the crystal cluster at
+        # (8.2, 5.2), and was duly added to the tour - a stop the 1x1m rover cannot physically
+        # occupy. The analysis isn't wrong; it just mustn't be turned into a driving goal.
         chamber_candidates = []
         bottleneck_candidates = []
         if self.geometry_ is not None:
             for chamber in self.geometry_['chambers']:
                 x, y = self.grid_to_world(chamber['row'], chamber['col'])
                 navigable = self.find_nearest_navigable_point(x, y)
-                if navigable is not None:
+                if navigable is not None and self.is_clear_of_artifacts(navigable[0], navigable[1]):
                     chamber_candidates.append(
                         (navigable[0], navigable[1],
                          f"chamber {2.0 * chamber['clearance_m']:.1f}m", 'chamber'))
             for bottleneck in self.geometry_['bottlenecks']:
                 x, y = self.grid_to_world(bottleneck['row'], bottleneck['col'])
                 navigable = self.find_nearest_navigable_point(x, y, clearance_cells=2)
-                if navigable is not None:
+                if navigable is not None and self.is_clear_of_artifacts(navigable[0], navigable[1]):
                     bottleneck_candidates.append(
                         (navigable[0], navigable[1],
                          f"passage {bottleneck['width_m']:.1f}m", 'bottleneck'))
