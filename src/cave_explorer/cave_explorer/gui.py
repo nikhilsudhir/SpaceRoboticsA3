@@ -4,9 +4,10 @@ Mission-control GUI for cave_explorer: a live mission-status dashboard, separate
 
 Shows the current mode/elapsed time/artefact counts/average speed, a mini schematic map
 (robot, current goal, artefact pins), a live artefact inventory table, and a scrolling event
-timeline - all driven by the 'gui_status' JSON topic published by cave_explorer_node (see
-publish_gui_status() there). Controls: Start Exploring, Pause/Resume, Force Return Home, and
-Export Summary (writes a text report for pasting into the project report).
+timeline, and the Advanced 5 science-tour route - all driven by the 'gui_status' JSON topic
+published by cave_explorer_node (see publish_gui_status() and gui_tour_summary() there).
+Controls: Start Exploring, Pause/Resume, Science Tour, Force Return Home, and Export Summary
+(writes a text report for pasting into the project report).
 
 Run with: ros2 run cave_explorer gui
 (after the other three launch files, same as RViz - see README).
@@ -47,6 +48,15 @@ STATUS_COLORS = {
     'abandoned': '#e67e22',
     'pending': '#e74c3c',
     'detected': '#8d99ae',
+}
+
+# Advanced 5 tour stops. Deliberately a different palette from STATUS_COLORS above: a tour stop
+# and an artefact are different things in the same picture (a stop can be a chamber or a passage
+# with no artefact at all), so they shouldn't share a colour language.
+TOUR_STOP_COLORS = {
+    'pending': '#00d4ff',
+    'visited': '#2ecc71',
+    'missed': '#e74c3c',
 }
 
 # What verb to show in the timeline the first time an artefact is seen in each status -
@@ -116,6 +126,13 @@ QPushButton#startButton:disabled {
     background-color: #2d313a;
     color: #6c7280;
 }
+QPushButton#tourButton:enabled {
+    background-color: #00d4ff;
+    color: #06212b;
+}
+QPushButton#tourButton:hover:!disabled {
+    background-color: #4ce0ff;
+}
 QTableWidget {
     background-color: #1e2127;
     gridline-color: #3a3f4b;
@@ -150,6 +167,11 @@ class GuiRosNode(Node):
         self.pause_mission_client = self.create_client(Trigger, 'pause_mission')
         self.resume_mission_client = self.create_client(Trigger, 'resume_mission')
         self.force_return_home_client = self.create_client(Trigger, 'force_return_home')
+        # Advanced 5. The node runs the tour by itself once exploration completes, but that
+        # needs the frontier search to dry up, which doesn't happen inside a demo-length run -
+        # so without this button the optimised tour was only reachable by calling the service
+        # from a terminal, and nobody driving the GUI ever saw it.
+        self.start_science_tour_client = self.create_client(Trigger, 'start_science_tour')
 
         # Real occupancy-grid map for MapWidget's background - subscribed directly here
         # (not routed through the gui_status JSON topic, which would be wasteful for a whole
@@ -218,6 +240,9 @@ class GuiRosNode(Node):
     def call_force_return_home(self):
         return self._call(self.force_return_home_client, 'force_return_home')
 
+    def call_start_science_tour(self):
+        return self._call(self.start_science_tour_client, 'start_science_tour')
+
 
 class MapWidget(QtWidgets.QWidget):
     """
@@ -236,6 +261,7 @@ class MapWidget(QtWidgets.QWidget):
         self._robot = None
         self._goal = None
         self._artifacts = []
+        self._tour = None
 
     def update_data(self, status, map_image, resolution, origin_x, origin_y):
         self._map_image = map_image
@@ -247,6 +273,7 @@ class MapWidget(QtWidgets.QWidget):
         gx, gy = status.get('goal_x'), status.get('goal_y')
         self._goal = (gx, gy) if gx is not None and gy is not None else None
         self._artifacts = status.get('artifacts', [])
+        self._tour = status.get('tour')
         self.update()
 
     def paintEvent(self, event):
@@ -278,6 +305,27 @@ class MapWidget(QtWidgets.QWidget):
             image_row = img_h - 1 - row  # the image was flipped vertically when built - see _map_callback()
             return QtCore.QPointF(offset_x + col * scale, offset_y + image_row * scale)
 
+        # Advanced 5: the optimised route, drawn under the artefact pins so it reads as the
+        # path between them rather than competing with them. Closed loop - the last leg back
+        # to the start is part of the cost the optimiser minimised, so it has to be visible.
+        if self._tour is not None and self._tour['stops']:
+            stop_points = [world_to_widget(stop['x'], stop['y']) for stop in self._tour['stops']]
+            painter.setPen(QtGui.QPen(QtGui.QColor('#00d4ff'), 1.6))
+            painter.drawPolygon(QtGui.QPolygonF(stop_points))
+
+            for stop, point in zip(self._tour['stops'], stop_points):
+                painter.setBrush(QtGui.QColor(TOUR_STOP_COLORS.get(stop['status'], '#00d4ff')))
+                painter.setPen(QtGui.QPen(QtGui.QColor('#06212b'), 1))
+                painter.drawEllipse(point, 7, 7)
+                painter.setPen(QtGui.QPen(QtGui.QColor('#06212b')))
+                font = painter.font()
+                font.setPointSize(7)
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(
+                    QtCore.QRectF(point.x() - 7, point.y() - 7, 14, 14),
+                    QtCore.Qt.AlignCenter, str(stop['position']))
+
         for art in self._artifacts:
             point = world_to_widget(art['x'], art['y'])
             painter.setBrush(QtGui.QColor(STATUS_COLORS.get(art['status'], '#ffffff')))
@@ -305,6 +353,7 @@ class MainWindow(QtWidgets.QWidget):
         # (discovered -> inspected/abandoned) is only announced once, not every poll tick.
         self._announced_events = set()
         self._mission_complete_announced = False
+        self._tour_complete_announced = False
         self._manual_control_enabled = False
 
         self.setWindowTitle('Cave Explorer - Mission Control')
@@ -365,6 +414,13 @@ class MainWindow(QtWidgets.QWidget):
         self.pause_button = QtWidgets.QPushButton('Pause')
         self.pause_button.setEnabled(False)
         self.pause_button.clicked.connect(self.on_pause_clicked)
+        self.science_tour_button = QtWidgets.QPushButton('Science Tour')
+        self.science_tour_button.setObjectName('tourButton')
+        self.science_tour_button.setToolTip(
+            'Advanced 5: stop exploring and revisit every science location on a 2-opt '
+            'optimised route')
+        self.science_tour_button.setEnabled(False)
+        self.science_tour_button.clicked.connect(self.on_science_tour_clicked)
         self.return_home_button = QtWidgets.QPushButton('Force Return Home')
         self.return_home_button.setEnabled(False)
         self.return_home_button.clicked.connect(self.on_return_home_clicked)
@@ -372,6 +428,7 @@ class MainWindow(QtWidgets.QWidget):
         self.export_button.clicked.connect(self.on_export_clicked)
         controls.addWidget(self.start_button, 2)
         controls.addWidget(self.pause_button, 1)
+        controls.addWidget(self.science_tour_button, 1)
         controls.addWidget(self.return_home_button, 1)
         controls.addWidget(self.export_button, 1)
         root.addLayout(controls)
@@ -410,7 +467,8 @@ class MainWindow(QtWidgets.QWidget):
             '<span style="color:#f1c40f">○</span> goal&nbsp;&nbsp;'
             '<span style="color:#2ecc71">●</span> visited&nbsp;&nbsp;'
             '<span style="color:#e74c3c">●</span> pending&nbsp;&nbsp;'
-            '<span style="color:#e67e22">●</span> abandoned')
+            '<span style="color:#e67e22">●</span> abandoned&nbsp;&nbsp;'
+            '<span style="color:#00d4ff">⬡—</span> tour route')
         legend.setStyleSheet('color: #9fb3c8; font-size: 11px;')
         map_layout.addWidget(legend)
         map_box.setLayout(map_layout)
@@ -490,6 +548,8 @@ class MainWindow(QtWidgets.QWidget):
         table_box.setLayout(table_layout)
         column.addWidget(table_box, 2)
 
+        column.addWidget(self._build_tour_box(), 2)
+
         timeline_box = QtWidgets.QGroupBox('Event Timeline')
         timeline_layout = QtWidgets.QVBoxLayout()
         self.timeline = QtWidgets.QListWidget()
@@ -498,6 +558,27 @@ class MainWindow(QtWidgets.QWidget):
         column.addWidget(timeline_box, 2)
 
         return column
+
+    def _build_tour_box(self):
+        """
+        Advanced 5's result panel. The saving (baseline vs optimised) is the number the task is
+        assessed on, so it gets its own line rather than being buried in the stop list.
+        """
+
+        box = QtWidgets.QGroupBox('Science Tour (Advanced 5)')
+        layout = QtWidgets.QVBoxLayout()
+
+        self.tour_summary_label = QtWidgets.QLabel(
+            'No tour planned yet - press Science Tour to plan one')
+        self.tour_summary_label.setStyleSheet('color: #9fb3c8; font-size: 11px;')
+        self.tour_summary_label.setWordWrap(True)
+        layout.addWidget(self.tour_summary_label)
+
+        self.tour_list = QtWidgets.QListWidget()
+        layout.addWidget(self.tour_list)
+
+        box.setLayout(layout)
+        return box
 
     @staticmethod
     def _value_label(text):
@@ -522,6 +603,19 @@ class MainWindow(QtWidgets.QWidget):
             self.ros_node.call_resume_mission()
         else:
             self.ros_node.call_pause_mission()
+
+    def on_science_tour_clicked(self):
+        """
+        Advanced 5. This interrupts exploration rather than queueing behind it: the node cancels
+        the current goal and switches to SCIENCE_TOUR on the next tick, which is the point of
+        having a button - you press it when you've seen enough of the cave, not after the
+        frontier search has exhausted itself.
+        """
+
+        if self.ros_node.call_start_science_tour():
+            self.science_tour_button.setEnabled(False)
+            self.science_tour_button.setText('Touring...')
+            self._add_timeline_event('SCIENCE TOUR requested - planning optimised route')
 
     def on_return_home_clicked(self):
         self.ros_node.call_force_return_home()
@@ -555,6 +649,27 @@ class MainWindow(QtWidgets.QWidget):
         for art in sorted(status['artifacts'], key=lambda a: a['id']):
             lines.append(
                 f"  #{art['id']:<4} {art['label']:<16} ({art['x']:>7.2f}, {art['y']:>7.2f})  {art['status']}")
+
+        # Advanced 5, if a tour was run: the baseline-vs-optimised comparison is the assessable
+        # result, so it belongs in the exported summary and not just the terminal log.
+        tour = status.get('tour')
+        if tour is not None:
+            visited = sum(1 for stop in tour['stops'] if stop['status'] == 'visited')
+            lines += [
+                '',
+                'Science Tour (Advanced 5):',
+                f"  Stops:       {len(tour['stops'])}",
+                f"  Baseline:    {tour['baseline_m']:.1f}m  (nearest neighbour)",
+                f"  Optimised:   {tour['optimised_m']:.1f}m  (2-opt)",
+                f"  Saved:       {tour['saved_m']:.1f}m ({tour['saved_percent']:.1f}%)",
+                f"  Reached:     {visited}/{len(tour['stops'])}",
+                '',
+                '  Optimised route:',
+            ]
+            for stop in tour['stops']:
+                lines.append(
+                    f"    {stop['position']:>2}. {stop['label']:<22} "
+                    f"({stop['x']:>7.2f}, {stop['y']:>7.2f})  [{stop['kind']}]  {stop['status']}")
 
         try:
             with open(path, 'w') as f:
@@ -592,6 +707,8 @@ class MainWindow(QtWidgets.QWidget):
             self.return_home_button.setEnabled(not status['mission_complete'])
             self.pause_button.setText('Resume' if status['mission_paused'] else 'Pause')
 
+        self._refresh_tour(status)
+
         if status['mission_complete']:
             self.start_button.setText('Mission Complete')
             if not self._mission_complete_announced:
@@ -603,6 +720,53 @@ class MainWindow(QtWidgets.QWidget):
 
         self._refresh_table(status['artifacts'])
         self._refresh_timeline(status['artifacts'])
+
+    def _refresh_tour(self, status):
+        """Advanced 5: keep the button state, the saving, and the stop list in step with the node."""
+
+        tour = status.get('tour')
+
+        # The button is only useful once the mission is running, there's something to tour, and
+        # a tour isn't already underway. Re-enabling it after a finished tour would re-plan over
+        # the same stops, so it stays disabled once complete.
+        if tour is None:
+            can_tour = (status['mission_started'] and not status['mission_complete']
+                        and not status['mission_paused'] and bool(status['artifacts']))
+            self.science_tour_button.setEnabled(can_tour)
+            self.science_tour_button.setText('Science Tour')
+            return
+
+        visited = sum(1 for stop in tour['stops'] if stop['status'] == 'visited')
+        missed = sum(1 for stop in tour['stops'] if stop['status'] == 'missed')
+        self.science_tour_button.setEnabled(False)
+        self.science_tour_button.setText('Tour Complete' if tour['complete'] else 'Touring...')
+        self.tour_summary_label.setText(
+            f"{len(tour['stops'])} stops &nbsp;|&nbsp; baseline <b>{tour['baseline_m']:.1f}m</b> "
+            f"&rarr; optimised <b>{tour['optimised_m']:.1f}m</b> &nbsp;|&nbsp; "
+            f"saved <b>{tour['saved_m']:.1f}m ({tour['saved_percent']:.1f}%)</b><br>"
+            f"visited {visited}, missed {missed}, "
+            f"at stop {min(tour['stop_index'] + 1, len(tour['stops']))}/{len(tour['stops'])}")
+
+        # Rebuilt wholesale rather than diffed: twelve rows at 5Hz is nothing, and the statuses
+        # change under us as the tour runs.
+        self.tour_list.clear()
+        for stop in tour['stops']:
+            item = QtWidgets.QListWidgetItem(
+                f"{stop['position']:>2}. {stop['label']:<22} "
+                f"({stop['x']:>6.1f}, {stop['y']:>6.1f})  [{stop['kind']}]")
+            item.setForeground(QtGui.QColor(TOUR_STOP_COLORS.get(stop['status'], '#e6e6e6')))
+            if stop['position'] == tour['stop_index'] + 1 and not tour['complete']:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self.tour_list.addItem(item)
+
+        if tour['complete'] and not self._tour_complete_announced:
+            self._tour_complete_announced = True
+            self._add_timeline_event(
+                f"SCIENCE TOUR COMPLETE - {visited}/{len(tour['stops'])} stops reached, "
+                f"route {tour['optimised_m']:.1f}m "
+                f"(saved {tour['saved_m']:.1f}m vs nearest-neighbour)")
 
     def _refresh_table(self, artifacts):
         self.table.setRowCount(len(artifacts))

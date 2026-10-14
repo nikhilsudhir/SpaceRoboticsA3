@@ -3198,7 +3198,7 @@ class CaveExplorer(Node):
             payload = {'mission_started': False, 'mission_paused': False, 'mission_complete': False,
                        'mode': 'WAITING', 'elapsed_s': 0.0, 'visited': 0, 'abandoned': 0, 'pending': 0,
                        'avg_speed_mps': 0.0, 'artifacts': [], 'robot_x': None, 'robot_y': None,
-                       'goal_x': None, 'goal_y': None, 'xlim': None, 'ylim': None}
+                       'goal_x': None, 'goal_y': None, 'xlim': None, 'ylim': None, 'tour': None}
             self.gui_status_pub_.publish(String(data=json.dumps(payload)))
             return
 
@@ -3254,8 +3254,43 @@ class CaveExplorer(Node):
             'goal_y': round(self.goal_target_y_, 2) if self.goal_target_y_ is not None else None,
             'xlim': list(self.xlim_),
             'ylim': list(self.ylim_),
+            'tour': self.gui_tour_summary(),
         }
         self.gui_status_pub_.publish(String(data=json.dumps(payload)))
+
+    def gui_tour_summary(self):
+        """
+        Advanced 5, for the GUI: the optimised route, the baseline it beat, and how far through
+        it we are. None until a tour has actually been planned.
+
+        Without this the tour was invisible to anyone driving from the GUI - the only evidence
+        it had run at all was the Mode field reading SCIENCE_TOUR, and the saving the task is
+        actually assessed on (baseline vs optimised) only ever appeared in the terminal log.
+        Stops are listed in visiting order rather than the order they were collected in, since
+        that order *is* the result.
+        """
+
+        if self.tour_ is None:
+            return None
+
+        stops = self.tour_['stops']
+        order = self.tour_['optimised_order']
+        return {
+            'baseline_m': round(self.tour_['baseline_cost_m'], 1),
+            'optimised_m': round(self.tour_['optimised_cost_m'], 1),
+            'saved_m': round(self.tour_['saved_m'], 1),
+            'saved_percent': round(self.tour_['saved_percent'], 1),
+            'stop_index': self.tour_stop_index_,
+            'complete': self.tour_complete_,
+            'stops': [{
+                'position': position + 1,
+                'label': stops[stop_index]['label'],
+                'kind': stops[stop_index]['kind'],
+                'x': round(stops[stop_index]['x'], 2),
+                'y': round(stops[stop_index]['y'], 2),
+                'status': stops[stop_index]['status'],
+            } for position, stop_index in enumerate(order)],
+        }
 
 def main():
     # Initialise
