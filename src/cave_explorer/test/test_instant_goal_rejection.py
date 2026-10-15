@@ -52,7 +52,7 @@ class FakeLogger:
         self.lines.append(msg)
 
 
-def make_inspection_node(duration_s, instant_failures=0, attempts=0):
+def make_inspection_node(duration_s, instant_failures=0, attempts=0, cancelled_by_pause=False):
     """
     A stand-in carrying only the state the INSPECT_ARTIFACT branch of main_loop() reads when a
     goal has just concluded. Only that branch is exercised - calling main_loop() itself would
@@ -65,6 +65,7 @@ def make_inspection_node(duration_s, instant_failures=0, attempts=0):
     node.inspection_instant_failures_ = instant_failures
     node.last_goal_succeeded_ = False
     node.last_goal_duration_s_ = duration_s
+    node.goal_cancelled_by_pause_ = cancelled_by_pause
     node.visited_artifact_ids_ = set()
     node.abandoned_artifact_ids_ = set()
     node._logger = FakeLogger()
@@ -79,7 +80,9 @@ def resolve_inspection_outcome(node):
     which reads the real source rather than trusting this copy.
     """
 
-    if node.last_goal_succeeded_:
+    if node.goal_cancelled_by_pause_:
+        node.goal_cancelled_by_pause_ = False
+    elif node.last_goal_succeeded_:
         node.visited_artifact_ids_.add(node.inspection_target_['id'])
         node.inspection_target_ = None
         node.inspection_attempts_ = 0
@@ -137,6 +140,25 @@ def test_a_real_approach_failure_still_abandons_after_one_retry():
 
     resolve_inspection_outcome(node)
     assert 62 in node.abandoned_artifact_ids_, 'second real failure should abandon'
+
+
+def test_a_pause_still_takes_priority_over_the_instant_check_for_inspection():
+    """
+    A pause-cancelled approach goal also concludes fast (often in well under
+    GOAL_INSTANT_FAILURE_S), so it must be read as the pause case, not as an instant rejection
+    or a real failure - exactly the bug the matching tour-path test above guards against, just
+    for Planning 3 inspection instead of Advanced 5 tour stops. Before this was fixed, a pause
+    mid-approach was indistinguishable from Nav2 genuinely failing the goal, and could burn a
+    real attempt (or even abandon the artefact outright) purely from the user pausing.
+    """
+
+    node = make_inspection_node(duration_s=0.0, cancelled_by_pause=True)
+    resolve_inspection_outcome(node)
+
+    assert node.inspection_target_ is not None, 'a pause must not give up on the target'
+    assert node.inspection_attempts_ == 0, 'a pause is not a failed approach attempt'
+    assert node.inspection_instant_failures_ == 0, 'a pause is not a Nav2 rejection either'
+    assert node.goal_cancelled_by_pause_ is False, 'the pause flag must be consumed'
 
 
 def test_a_slow_failure_counts_even_after_instant_ones():
@@ -334,6 +356,22 @@ def test_the_source_still_branches_on_the_instant_case():
         source)
     assert branch is not None, \
         'main_loop no longer special-cases an instantly-rejected inspection goal'
+
+
+def test_the_source_still_checks_for_a_pause_before_counting_an_inspection_failure():
+    """
+    Guards the pause-priority branch resolve_inspection_outcome() now also copies - without
+    this, the real INSPECT_ARTIFACT branch could silently lose its pause check again (e.g. a
+    future refactor) while this file's copy, and every test above using it, kept passing.
+    """
+
+    source = pathlib.Path(cave_explorer.__file__).read_text(encoding='utf-8')
+    branch = re.search(
+        r'if self\.planner_type_ == PlannerType\.INSPECT_ARTIFACT:.{0,400}?'
+        r'if self\.goal_cancelled_by_pause_:',
+        source, re.DOTALL)
+    assert branch is not None, \
+        'main_loop no longer checks goal_cancelled_by_pause_ before scoring an INSPECT_ARTIFACT outcome'
 
 
 def test_nav2_is_no_longer_given_20ms_to_answer_itself():

@@ -262,7 +262,7 @@ Visualization Manager:
           Value: true
         Value: false
       Enabled: true
-      Keep: 0
+      Keep: 2000
       Name: Odometry Path
       Position Tolerance: 2
       Shape:

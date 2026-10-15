@@ -41,6 +41,8 @@ Inside `src/cave_explorer/`:
 
 This has been developed and tested on **Ubuntu 22.04** with **ROS2 Humble**. If you don't have ROS2 installed yet, follow the [official Humble installation guide](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) first (desktop install recommended, since it includes RViz).
 
+**Prefer native Linux over WSL2 if you have the choice.** Gazebo + Nav2 + SLAM + RViz all running together is CPU/GPU-heavy, and WSL2 adds two real sources of overhead on top of that: CPU scheduling jitter from running inside a VM (sharing the machine with Windows' own background processes), and a graphics passthrough layer (WSLg) for Gazebo/RViz's 3D rendering. In practice this showed up as `slam_toolbox`'s published `map`→`odom` transform falling behind real time by over a second, which repeatedly tripped Nav2's `controller_server` ("Controller patience exceeded", path aborted) and made the robot crawl at a fraction of its normal speed - see [Troubleshooting](#troubleshooting). It still runs on WSL2, just less reliably; if you're already on WSL2 and hit this, closing other apps and giving the VM more cores/RAM helps, but native Linux avoids the problem at the source.
+
 You'll also need **Gazebo Fortress**, which is the 3D simulator used for the cave environment. Install it by following [these instructions](https://gazebosim.org/docs/fortress/install_ubuntu/).
 
 ### ROS package dependencies
@@ -305,6 +307,7 @@ All of this is driven by one JSON-encoded topic, `gui_status`, published once a 
 - **`clearance_map` looks blank or solid black in RViz** — its Map display is still on the default `map` colour scheme, which renders the 0–100 clearance values as near-black. Switch that display's **Color Scheme** to `costmap`.
 - **The science tour is skipped with "not enough locations"** — the tour needs at least `TOUR_MIN_LOCATIONS` (8) distinct stops, and a short run in a small part of the cave may not produce that many artefacts and geometry features. Explore longer, or lower the constant in `cave_explorer.py`.
 - **The robot never starts moving** — it waits for the `start_mission` trigger (see [Autonomous exploration](#autonomous-exploration-and-artefact-inspection-planning-13) above) rather than beginning automatically; click **Start Exploring** in the GUI or call the service directly.
+- **Repeated `Transform data too old` / `Controller patience exceeded` / `[follow_path] Aborting handle` in the `controller_server` log, robot crawling or barely moving** — `slam_toolbox` isn't publishing the `map`→`odom` transform fast enough to keep up with real time, usually from CPU contention. Very common on WSL2 (see the [Prerequisites](#prerequisites) note above) - close other heavy apps (especially another Gazebo/RViz instance) and give the WSL2 VM more cores/RAM if you can't switch to native Linux. Not caused by anything in `cave_explorer.py` itself.
 
 ## Development notes
 
