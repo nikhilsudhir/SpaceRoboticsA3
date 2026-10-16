@@ -3,7 +3,7 @@
 import os
 import sys
 
-# Advanced 1 prep: the trained artefact classifier (see build_classifier_dataset.py and
+# Perception 2: the trained artefact classifier (see build_classifier_dataset.py and
 # config/artifact_classifier/) is loaded via tflite_runtime rather than full tensorflow - much
 # lighter weight for a ROS node that only needs inference, not training.
 #
@@ -100,7 +100,8 @@ def dilate8_mask(mask):
     return out
 
 
-def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolution_m):
+def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolution_m,
+                                 written_off_mask=None):
     """
     Planning 1: measure how much of the *reachable* cave is still unseen.
 
@@ -121,6 +122,11 @@ def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolu
     goal. Those filters exist to make goal selection sensible, not to describe the map, and
     mistaking them for a description of the map is exactly how the old completeness test went
     wrong - see update_exploration_coverage().
+
+    'written_off_mask' is the one deliberate exception, kept as a separate, named argument so it
+    can't be confused with those filters: cells near small frontiers the rover has already
+    driven to FRONTIER_MAX_FALLBACK_ATTEMPTS times without clearing. They are reported as
+    'written_off_frontier_cells' rather than as unseen cave.
     """
 
     known = grid >= 0
@@ -128,6 +134,9 @@ def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolu
     reachable = path_distance_grid >= 0
     reachable_free = free & reachable
     reachable_frontier = frontier_mask & reachable
+    written_off_frontier = np.zeros_like(reachable_frontier) if written_off_mask is None \
+        else reachable_frontier & written_off_mask
+    reachable_frontier = reachable_frontier & ~written_off_frontier
     cell_area_m2 = resolution_m * resolution_m
 
     reachable_frontier_cells = int(np.count_nonzero(reachable_frontier))
@@ -137,9 +146,78 @@ def measure_exploration_coverage(grid, frontier_mask, path_distance_grid, resolu
         'known_cells': int(np.count_nonzero(known)),
         'reachable_free_cells': reachable_free_cells,
         'reachable_frontier_cells': reachable_frontier_cells,
+        'written_off_frontier_cells': int(np.count_nonzero(written_off_frontier)),
         'mapped_area_m2': reachable_free_cells * cell_area_m2,
         'unseen_frontier_area_m2': reachable_frontier_cells * cell_area_m2,
     }
+
+
+def points_within_radius_mask(shape, origin_xy, resolution_m, points_xy, radius_m):
+    """
+    Planning 1: boolean grid mask (rows = y, cols = x, like the occupancy grid) of every cell
+    whose centre is within radius_m of any of points_xy, given in map coordinates.
+    """
+
+    mask = np.zeros(shape, dtype=bool)
+    if not points_xy:
+        return mask
+    rows, cols = np.indices(shape)
+    xs = origin_xy[0] + (cols + 0.5) * resolution_m
+    ys = origin_xy[1] + (rows + 0.5) * resolution_m
+    for px, py in points_xy:
+        mask |= (xs - px) ** 2 + (ys - py) ** 2 <= radius_m * radius_m
+    return mask
+
+
+def wavefront_distance(passable, start_row, start_col):
+    """
+    Wavefront BFS over a boolean 'passable' grid from (start_row, start_col): path distance in
+    cells, -1 where unreachable. The vectorised core of compute_path_distance_grid().
+    """
+
+    height, width = passable.shape
+    dist = np.full((height, width), -1, dtype=np.int32)
+    if not (0 <= start_row < height and 0 <= start_col < width) or not passable[start_row, start_col]:
+        return dist
+
+    dist[start_row, start_col] = 0
+    frontier = np.zeros((height, width), dtype=bool)
+    frontier[start_row, start_col] = True
+    d = 0
+    while frontier.any():
+        d += 1
+        expanded = dilate8_mask(frontier) & passable & (dist == -1)
+        if not expanded.any():
+            break
+        dist[expanded] = d
+        frontier = expanded
+    return dist
+
+
+def trace_grid_path(distance_grid, end_row, end_col):
+    """
+    Advanced 5 (display only): walk a wavefront distance grid (see compute_path_distance_grid())
+    back from (end_row, end_col) to its start cell, always stepping to a neighbour one ring
+    closer. Returns the cells from start to end, or [] if the end isn't reachable.
+    """
+
+    height, width = distance_grid.shape
+    if not (0 <= end_row < height and 0 <= end_col < width) or distance_grid[end_row, end_col] < 0:
+        return []
+    path = [(end_row, end_col)]
+    row, col = end_row, end_col
+    while distance_grid[row, col] > 0:
+        target = distance_grid[row, col] - 1
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            r, c = row + dr, col + dc
+            if 0 <= r < height and 0 <= c < width and distance_grid[r, c] == target:
+                row, col = r, c
+                break
+        else:
+            return []
+        path.append((row, col))
+    path.reverse()
+    return path
 
 
 def pose2d_to_pose(pose_2d):
@@ -357,7 +435,53 @@ class PlannerType(Enum):
 # A single detected artifact in the current camera frame.
 # 'bbox' is (x, y, width, height) in pixel coordinates.
 # 'color_rgb' is the colour (as an (r, g, b) tuple) used to draw/label this detection.
-Detection = namedtuple('Detection', ['label', 'bbox', 'color_rgb'])
+# 'verified' is set only when the trained classifier itself called the crop a stop sign - see
+# STOP_SIGN_CONFIRMATION_OBSERVATIONS for why that matters.
+Detection = namedtuple('Detection', ['label', 'bbox', 'color_rgb', 'verified'], defaults=[False])
+
+# Perception 3: how a detection's distance is read from the depth image (see
+# estimate_detection_depth()). Sampling only the bbox centre broke on thin artefacts: the centre
+# pixel of a green_alien's box can fall between its limbs onto the cave wall behind it - live,
+# that placed one 4.4m beyond the real alien, outside ARTIFACT_DUPLICATE_RADIUS_M, so it became
+# a second, wrongly-labelled cluster the rover then "inspected". The artefact is the nearest
+# thing inside its own box, so a low percentile of the whole box's depths lands on it as long as
+# it covers more than that share of the (inset) box - a side-on alien can cover under a quarter -
+# while staying clear of the odd stray near pixel that a plain minimum would latch onto.
+DEPTH_SAMPLE_PERCENTILE = 10
+# Fraction trimmed off each side of the bbox before sampling, so the box's edges (which take in
+# a sliver of floor in front of the artefact as well as background) don't count.
+DEPTH_SAMPLE_INSET_FRACTION = 0.15
+
+
+def exploration_goal_timeout_s(path_distance_m):
+    """
+    Planning 1: the watchdog ceiling for a frontier goal 'path_distance_m' away by path - never
+    below GOAL_TIMEOUT_S, longer for far frontiers. See EXPLORE_MIN_SPEED_MPS's comment.
+    """
+
+    return max(GOAL_TIMEOUT_S, path_distance_m / EXPLORE_MIN_SPEED_MPS)
+
+
+def estimate_detection_depth(depth_image, bbox):
+    """
+    Perception 3: the distance (metres, along the camera's optical axis) to the object inside
+    'bbox', or None if the depth image has no valid reading there (missing/out-of-range).
+    See DEPTH_SAMPLE_PERCENTILE's comment for why this samples the whole box.
+    """
+
+    depth_height, depth_width = depth_image.shape[:2]
+    x, y, width, height = bbox
+    inset_x = int(width * DEPTH_SAMPLE_INSET_FRACTION)
+    inset_y = int(height * DEPTH_SAMPLE_INSET_FRACTION)
+    row_lo = max(0, y + inset_y)
+    row_hi = min(depth_height, y + height - inset_y)
+    col_lo = max(0, x + inset_x)
+    col_hi = min(depth_width, x + width - inset_x)
+    depth_patch = depth_image[row_lo:row_hi, col_lo:col_hi]
+    valid_depths = depth_patch[np.isfinite(depth_patch) & (depth_patch > 0.0)]
+    if valid_depths.size == 0:
+        return None
+    return float(np.percentile(valid_depths, DEPTH_SAMPLE_PERCENTILE))
 
 # Perception 2: colour/contour-based detectors for the artefact types, other than the
 # stop sign (which is handled separately by the provided cascade classifier).
@@ -440,7 +564,7 @@ ARTIFACT_COLOR_PROFILES = [
 # Lookup used to colour Perception 3's RViz markers to match each artefact's Perception 2 detection colour
 ARTIFACT_COLOR_BY_LABEL = {profile['label']: profile['color_rgb'] for profile in ARTIFACT_COLOR_PROFILES}
 
-# Advanced 1: trained-classifier refinement of the HSV detections above. The Perception 1
+# Perception 2: trained-classifier refinement of the HSV detections above. The Perception 1
 # dataset's own sorting process (manually verifying hundreds of HSV-detected crops by eye)
 # surfaced real, persistent cross-label confusion in the live detector itself - most notably
 # green_alien/green_crystals (adjacent hue ranges; a distant or partially-lit alien can produce
@@ -464,6 +588,18 @@ CLASSIFIER_CROP_MARGIN_PX = 15
 # HSV label is kept as-is rather than risking a low-confidence relabel/rejection overriding a
 # perfectly good HSV match.
 CLASSIFIER_CONFIDENCE_THRESHOLD = 0.6
+# A stop sign is only 'verified' (and so able to purge artefacts - see
+# STOP_SIGN_CONFIRMATION_OBSERVATIONS) at this much higher confidence. Live, the cascade fired on
+# part of a real green alien and the classifier agreed it was a stop sign on 3 frames running at
+# ordinary confidence, which purged the alien. Real signs read 0.9+ on plenty of frames as the
+# rover passes, so they still get verified; borderline calls no longer can delete anything.
+STOP_SIGN_VERIFY_CONFIDENCE = 0.9
+# A stop sign with no valid depth reading is only placed at the rover's own position if its box
+# is at least this wide (a quarter of the image), i.e. the rover really is right up against it.
+# Depth also goes invalid when the sign is too FAR for the depth camera, and live that put two
+# correctly-recognised signs 11-16m away at the rover's position instead - right next to the
+# white sphere and green crystals it had just inspected, which were then purged as "the sign".
+STOP_SIGN_FALLBACK_MIN_WIDTH_PX = 180
 # Below this box area (pixels, before the margin/resize in classify_crop()), the classifier is
 # skipped entirely and the original HSV label is kept, regardless of confidence. Reported live:
 # a small fragment of one artefact (a distant sliver, a partially-occluded edge) regularly gets
@@ -480,10 +616,6 @@ CLASSIFIER_CONFIDENCE_THRESHOLD = 0.6
 # through, or if real small-but-genuine sightings start getting starved of correction instead.
 CLASSIFIER_MIN_CROP_AREA_PX = 2500
 CLASSIFIER_NEGATIVE_LABEL = 'negative'
-# Perception 2's own cascade classifier for stop signs is already a dedicated, reliable
-# detector (see detect_stop_signs()) - not part of the HSV cross-label confusion this is meant
-# to fix, so stop_sign detections are left untouched rather than re-judged by this classifier.
-CLASSIFIER_SKIP_LABELS = frozenset({'stop_sign'})
 
 # Perception 3 robustness: an artefact-label detection whose world position lands within this
 # many metres of a REMEMBERED stop sign position is rejected outright, not just localised and
@@ -495,7 +627,19 @@ CLASSIFIER_SKIP_LABELS = frozenset({'stop_sign'})
 # detection in that same frame to suppress it against at all. Remembering where stop signs
 # actually are, once seen clearly, and rejecting anything landing on top of that position
 # afterwards closes that gap regardless of whether the cascade fires again.
-STOP_SIGN_EXCLUSION_RADIUS_M = 1.5
+# 1.5m proved too tight: a live run confirmed an ice_formation ghost 1.51m from a stop sign the
+# classifier had just recognised (an HSV fragment of the sign's panel projects to a different
+# depth than the sign's own box centre). The nearest real artefact to any stop sign in
+# mars_cave.sdf is 6.4m away, so 2.5m leaves plenty of margin.
+STOP_SIGN_EXCLUSION_RADIUS_M = 2.5
+# A stop sign position only counts (for both the exclusion above and the ghost purge in
+# remember_stop_sign_position()) once this many sightings have landed near it - the same
+# one-off-noise filter ARTIFACT_CONFIRMATION_OBSERVATIONS applies to artefacts. The cascade
+# behind detect_stop_signs() does misfire: a single false hit just after inspecting a white
+# sphere at close range (no depth there, so the rover's own position stood in for the "sign")
+# was enough to purge that real, already-inspected sphere and blank out its spot for the rest
+# of the mission. A real sign gets several hits as the rover drives past it; a stray one doesn't.
+STOP_SIGN_CONFIRMATION_OBSERVATIONS = 3
 
 # The RGB-D camera's colour and depth images share one sensor (single <camera> block in
 # mars_explorer.gazebo.xacro), so both use the same intrinsics computed from its resolution/FOV.
@@ -549,6 +693,25 @@ FRONTIER_OCCUPIED_THRESHOLD = 50
 # unexplored territory - letting those count as frontiers was the main cause of the robot
 # "mopping up" small scraps near where it'd already been instead of pushing into new areas.
 FRONTIER_MIN_CLUSTER_SIZE = 15
+# ...but only while bigger frontiers exist. At 0.3 m per cell, 15 cells is 4.5 m of frontier,
+# and the mouth of a side pocket seen past a corner is often narrower than that - live, one
+# area near the start was never entered in any run, while 57-59 reachable frontier cells sat
+# unclaimed (too small to be goals) and the rover random-walked instead. Those same cells kept
+# the count above EXPLORATION_RESIDUAL_FRONTIER_CELLS, so exploration never completed and the
+# science tour never started. So once no cluster of FRONTIER_MIN_CLUSTER_SIZE is left, clusters
+# down to this size (0.9 m) become goals too - see choose_frontier_goal().
+FRONTIER_FALLBACK_MIN_CLUSTER_SIZE = 3
+# A small (fallback) frontier still open after this many goals near it is written off: the lidar
+# can't fill it in (a notch behind a rock edge it can only graze), or Nav2 can't get there. It is
+# no longer chosen, and its cells stop counting against exploration completeness - otherwise the
+# rover would keep returning to the same unfillable scrap and exploration could never finish.
+# One try, not two: live, a 3-cell scrap at (-0.3, 42.7) sat beyond Nav2's inflated walls, so
+# every attempt was 40s of "failed to create plan" before the watchdog gave up.
+FRONTIER_MAX_FALLBACK_ATTEMPTS = 1
+# Goals within this distance (metres) count as attempts on the same small frontier, and cells
+# within it of a written-off frontier are excluded (from selection and from the completeness
+# count). Smaller than FRONTIER_REVISIT_RADIUS_M so it only covers the scrap itself.
+FRONTIER_FALLBACK_SPOT_RADIUS_M = 2.0
 # How far (metres) a frontier's score is allowed to "travel" before distance starts
 # significantly discounting it - see choose_frontier_goal()'s score formula. Larger means
 # distance matters less relative to size, so a big far frontier can still beat a tiny close one.
@@ -753,6 +916,17 @@ RETURN_HOME_MIN_SPEED_MPS = 0.3
 # together by accident.
 TOUR_MIN_SPEED_MPS = 0.3
 
+# Planning 1 robustness: the same idea again for frontier goals - see
+# exploration_goal_timeout_s(). Frontiers are chosen across the whole explored map, so once the
+# near ones are used up the best one is routinely 40-50m away by path. The flat GOAL_TIMEOUT_S
+# cancelled those mid-drive while the rover was moving normally - one live run logged 7 frontier
+# goals "timed out in 45s" at 0.8-1.1 m/s average, 36-50m covered. Each cancel sent the rover
+# toward a fresh frontier, often back the way it came, so it shuttled along the central corridor
+# instead of finishing the cave. Faster than TOUR_MIN_SPEED_MPS on purpose: a genuinely stuck
+# exploration goal is still cut off by GOAL_PROGRESS_STALL_S, so this ceiling only ever extends
+# a goal that is making progress, and exploration time is worth protecting.
+EXPLORE_MIN_SPEED_MPS = 0.5
+
 # Planning 1/3 robustness: a companion to GOAL_TIMEOUT_S that reacts to Nav2's own
 # distance_remaining feedback (see feedback_callback()) rather than waiting out a flat
 # duration regardless of whether the robot is actually making progress. If distance_remaining
@@ -781,6 +955,16 @@ GOAL_PROGRESS_STALL_S = 40.0
 # How much (metres) distance_remaining must decrease to count as "real" forward progress,
 # rather than feedback noise/jitter resetting the GOAL_PROGRESS_STALL_S timer forever.
 GOAL_PROGRESS_EPSILON_M = 0.15
+
+# Planning 2 / Advanced 5: an inspection or tour goal is accepted as reached if the rover is
+# within GOAL_CLOSE_ENOUGH_M of it and has stopped getting closer for GOAL_CLOSE_ENOUGH_STALL_S.
+# Live, the rover drove all 11.6m to green_crystals #0's standoff, then sat ~1m short for 30s
+# ("Failed to make progress" twice) and the goal timed out at 45s - it couldn't complete the final
+# turn to face the artefact beside the crystal spikes. A re-sent goal 1m away "succeeded" in 1s,
+# which shows the rover was already where it needed to be. For viewing an artefact or standing
+# at a tour stop, 1.5m is plenty; exploration goals keep the normal watchdog.
+GOAL_CLOSE_ENOUGH_M = 1.5
+GOAL_CLOSE_ENOUGH_STALL_S = 8.0
 
 # Advanced 2: how often (seconds) to re-run the cave geometry analysis - see
 # update_cave_geometry(). The task asks for the distance transform to be computed/updated
@@ -811,6 +995,19 @@ GEOMETRY_FEATURE_SEPARATION_M = 4.0
 # per location (see build_tour_cost_matrix()), so this is the knob that bounds that work.
 TOUR_MIN_LOCATIONS = 8
 TOUR_MAX_LOCATIONS = 12
+# Advanced 5 (display only): keep every Nth grid cell of a traced route leg when drawing it -
+# see tour_route_points(). 3 cells is 0.9m, smooth enough to follow corridors at a fraction of
+# the points.
+TOUR_ROUTE_STEP_CELLS = 3
+# Advanced 5 (display only): the drawn route keeps at least this far (metres) from walls, trying
+# each value in turn until a leg can be traced. The shortest grid path hugs the walls, which is
+# not where the rover drives - Nav2 inflates obstacles by 1.0m (nav2_params.yaml) and steers down
+# the middle of corridors. Unknown space counts as wall. 0.0 is the plain shortest path, kept as
+# the last resort so a leg is never left undrawn.
+TOUR_ROUTE_CLEARANCES_M = (1.0, 0.7, 0.4, 0.0)
+# Around each stop the clearance rule is waived within this radius, so a stop sitting near a wall
+# can still be reached by the drawn line.
+TOUR_ROUTE_STOP_RADIUS_M = 1.2
 
 # Advanced 5: how far from an artefact the tour stops - so a science stop is a viewpoint of the
 # artefact rather than a point inside it - comes from artifact_standoff_distance(), shared with
@@ -859,6 +1056,9 @@ class CaveExplorer(Node):
         # Planning 1: (x, y, time_sent) of frontier goals sent within the last
         # FRONTIER_REVISIT_WINDOW_S - see that constant's comment above.
         self.recent_frontier_goals_ = []
+        # Planning 1: small fallback frontiers already targeted, as {'x', 'y', 'attempts'} in
+        # map coordinates - see FRONTIER_MAX_FALLBACK_ATTEMPTS.
+        self.fallback_frontier_attempts_ = []
         self.frontier_markers_pub_ = self.create_publisher(MarkerArray, 'frontier_markers', 1)
         # Planning 1: consecutive ticks with a real map but no frontier candidates. Log
         # verbosity only - see NO_FRONTIER_LOG_STREAK, and update_exploration_coverage() for
@@ -896,6 +1096,10 @@ class CaveExplorer(Node):
         # goal_reached_callback below).
         self.visited_artifact_ids_ = set()
         self.abandoned_artifact_ids_ = set()
+        # Planning 3: clusters approached for inspection that turned out, up close, not to be an
+        # inspection type after all - see the INSPECT_ARTIFACT branch of main_loop(). Kept apart
+        # from visited_artifact_ids_ so they don't count as inspections.
+        self.dismissed_artifact_ids_ = set()
         self.inspection_attempts_ = 0
         # Instant failures for the current target, counted separately from inspection_attempts_
         # so Nav2 plumbing hiccups can't write an artefact off - see GOAL_INSTANT_FAILURE_S.
@@ -917,8 +1121,14 @@ class CaveExplorer(Node):
         self.marker_pub_ = self.create_publisher(MarkerArray, 'marker_array_artifacts', 10)
 
         # Perception 3: world positions of stop signs seen so far (list of Point) - see
-        # STOP_SIGN_EXCLUSION_RADIUS_M's comment for why this exists.
+        # STOP_SIGN_EXCLUSION_RADIUS_M's comment for why this exists. Only CONFIRMED signs live
+        # here; sightings still short of STOP_SIGN_CONFIRMATION_OBSERVATIONS wait in
+        # stop_sign_candidates_ as {'position': Point, 'count': int}.
         self.stop_sign_positions_ = []
+        # Verified sightings of each remembered sign (same index as stop_sign_positions_) - the
+        # sign's side of the evidence comparison in purge_artifacts_near_stop_sign()
+        self.stop_sign_counts_ = []
+        self.stop_sign_candidates_ = []
 
         # Initialise CvBridge
         self.cv_bridge_ = CvBridge()
@@ -1168,7 +1378,7 @@ class CaveExplorer(Node):
             self.detect_stop_signs(image) + self.detect_color_artifacts(image),
             priority_labels={'stop_sign'})
 
-        # Advanced 1: re-examine each HSV detection with the trained classifier - confirms,
+        # Perception 2: re-examine each HSV detection with the trained classifier - confirms,
         # relabels (fixes cross-label confusion like green_alien/green_crystals), or drops it
         # entirely (if the classifier is confident it's actually 'negative' - a false positive).
         # See CLASSIFIER_* constants' comments above for why this exists.
@@ -1252,7 +1462,7 @@ class CaveExplorer(Node):
 
     def load_artifact_classifier(self):
         """
-        Advanced 1: load the trained artefact classifier (see CLASSIFIER_* constants' comment
+        Perception 2: load the trained artefact classifier (see CLASSIFIER_* constants' comment
         above, and build_classifier_dataset.py for how its training data was produced).
 
         Returns (interpreter, labels) - labels is a list indexed to match the model's output
@@ -1293,7 +1503,7 @@ class CaveExplorer(Node):
 
     def classify_crop(self, image, bbox):
         """
-        Advanced 1: run the trained classifier on the region of 'image' (RGB) given by 'bbox',
+        Perception 2: run the trained classifier on the region of 'image' (RGB) given by 'bbox',
         returning (predicted_label, confidence). Returns (None, 0.0) if the classifier isn't
         loaded (see load_artifact_classifier()).
 
@@ -1333,9 +1543,16 @@ class CaveExplorer(Node):
 
     def refine_detections_with_classifier(self, image, detections):
         """
-        Advanced 1: pass each HSV detection (other than CLASSIFIER_SKIP_LABELS) through the
-        trained classifier, using it to confirm, relabel, or reject (drop) the HSV guess - see
-        CLASSIFIER_* constants' comment above for why this exists and what it fixes.
+        Perception 2: pass each detection through the trained classifier, using it to confirm,
+        relabel, or reject (drop) the detector's guess - see CLASSIFIER_* constants' comment
+        above for why this exists and what it fixes.
+
+        That includes the stop sign cascade's detections. The cascade was treated as reliable and
+        skipped, but live it misfired for several frames at a time on real artefacts (green
+        crystals, a green alien, white spheres), and each misfire became a remembered "stop sign"
+        that purged the artefact under it. A confident classifier verdict now relabels or drops
+        such a hit, and a detection's 'verified' flag records that the classifier itself agreed
+        (only verified stop signs are remembered - see localise_artifacts()).
 
         A low-confidence classifier opinion (below CLASSIFIER_CONFIDENCE_THRESHOLD) is treated
         as inconclusive rather than acted on - the original HSV label passes through unchanged
@@ -1351,10 +1568,7 @@ class CaveExplorer(Node):
 
         refined = []
         for detection in detections:
-            if detection.label in CLASSIFIER_SKIP_LABELS:
-                refined.append(detection)
-                continue
-
+            source = 'cascade' if detection.label == 'stop_sign' else 'HSV'
             _, _, w, h = detection.bbox
             if w * h < CLASSIFIER_MIN_CROP_AREA_PX:
                 refined.append(detection)
@@ -1365,17 +1579,25 @@ class CaveExplorer(Node):
                 refined.append(detection)
             elif predicted_label == CLASSIFIER_NEGATIVE_LABEL:
                 self.get_logger().info(
-                    f'    CLASSIFIER: rejected HSV {detection.label} as negative '
+                    f'    CLASSIFIER: rejected {source} {detection.label} as negative '
                     f'(confidence {confidence:.2f})')
                 continue  # classifier confident this is a false positive - drop it
             elif predicted_label != detection.label:
                 self.get_logger().info(
-                    f'    CLASSIFIER: relabelled HSV {detection.label} -> {predicted_label} '
+                    f'    CLASSIFIER: relabelled {source} {detection.label} -> {predicted_label} '
                     f'(confidence {confidence:.2f})')
                 color_rgb = ARTIFACT_COLOR_BY_LABEL.get(predicted_label, detection.color_rgb)
-                refined.append(Detection(predicted_label, detection.bbox, color_rgb))
+                refined.append(Detection(predicted_label, detection.bbox, color_rgb,
+                                         verified=predicted_label != 'stop_sign'
+                                         or confidence >= STOP_SIGN_VERIFY_CONFIDENCE))
             else:
-                refined.append(detection)
+                if detection.label == 'stop_sign':
+                    # Logged because a verified sign can purge artefacts - this used to be silent
+                    self.get_logger().info(
+                        f'    CLASSIFIER: confirmed cascade stop_sign (confidence {confidence:.2f})')
+                refined.append(detection._replace(
+                    verified=detection.label != 'stop_sign'
+                    or confidence >= STOP_SIGN_VERIFY_CONFIDENCE))
 
         return refined
 
@@ -1538,7 +1760,13 @@ class CaveExplorer(Node):
         # waiting for a closer, clearer sighting costs very little time and fixes the problem at
         # the source rather than hoping enough later close-up votes can outvote the early wrong
         # ones before the rover commits to visiting it.
-        stop_sign_detections = [d for d in detections if d.label == 'stop_sign']
+        #
+        # A stop sign is only remembered once the trained classifier has agreed it IS one (see
+        # refine_detections_with_classifier()): unchecked cascade hits on real artefacts were
+        # purging them. Without a classifier there's nothing to check against, so every hit
+        # counts, as before.
+        stop_sign_detections = [d for d in detections if d.label == 'stop_sign'
+                                and (d.verified or self.classifier_interpreter_ is None)]
         artifact_detections = [d for d in detections if d.label != 'stop_sign'
                                 and d.bbox[2] * d.bbox[3] >= CLASSIFIER_MIN_CROP_AREA_PX]
         if (not stop_sign_detections and not artifact_detections) or self.latest_depth_image_ is None:
@@ -1571,6 +1799,12 @@ class CaveExplorer(Node):
                 # current position is a perfectly good stand-in here: this close, "the sign is
                 # near the rover" is actually more reliable than a depth reading would be anyway,
                 # and it's well within STOP_SIGN_EXCLUSION_RADIUS_M of the sign's true position.
+                #
+                # But only when the sign really is close - see STOP_SIGN_FALLBACK_MIN_WIDTH_PX. A
+                # small box means a distant sign beyond depth range, and the rover's position
+                # would be the wrong place for it entirely.
+                if detection.bbox[2] < STOP_SIGN_FALLBACK_MIN_WIDTH_PX:
+                    continue
                 robot_pose = self.get_pose_2d()
                 if robot_pose is None:
                     continue
@@ -1590,34 +1824,29 @@ class CaveExplorer(Node):
             if any(math.hypot(position.x - sign.x, position.y - sign.y) < STOP_SIGN_EXCLUSION_RADIUS_M
                    for sign in self.stop_sign_positions_):
                 continue
-            self.add_artifact_observation(detection.label, position)
+            # Only a label the classifier stood behind gets a vote, weighted by how big (so how
+            # close) the artefact appears - see add_artifact_observation()
+            voted = detection.verified or self.classifier_interpreter_ is None
+            self.add_artifact_observation(
+                detection.label, position,
+                label_vote=detection.bbox[2] * detection.bbox[3] if voted else 0)
 
         self.publish_artifact_markers()
 
     def project_detection_to_map(self, detection, depth_image, camera_to_map_transform):
         """
-        Perception 3: unproject a detection's bbox centre to a map-frame Point, using the depth
-        camera's reading at that pixel (see localise_artifacts()'s docstring for the method).
-        Returns None if there's no valid depth reading there (missing/out-of-range).
+        Perception 3: unproject a detection's bbox centre to a map-frame Point, at the depth
+        estimate_detection_depth() reads from its box (see localise_artifacts()'s docstring for
+        the method). Returns None if there's no valid depth reading there (missing/out-of-range).
         """
 
-        depth_height, depth_width = depth_image.shape[:2]
         x, y, width, height = detection.bbox
         pixel_x = x + width / 2.0
         pixel_y = y + height / 2.0
 
-        # Sample a small patch around the detection's centre pixel and take the median depth,
-        # to be robust to individual noisy/missing (inf/NaN) depth readings
-        patch_half_size = 2
-        row_lo = max(0, int(pixel_y) - patch_half_size)
-        row_hi = min(depth_height, int(pixel_y) + patch_half_size + 1)
-        col_lo = max(0, int(pixel_x) - patch_half_size)
-        col_hi = min(depth_width, int(pixel_x) + patch_half_size + 1)
-        depth_patch = depth_image[row_lo:row_hi, col_lo:col_hi]
-        valid_depths = depth_patch[np.isfinite(depth_patch) & (depth_patch > 0.0)]
-        if valid_depths.size == 0:
+        depth = estimate_detection_depth(depth_image, detection.bbox)
+        if depth is None:
             return None
-        depth = float(np.median(valid_depths))
 
         # Unproject the pixel to a 3D point in the camera's optical frame
         # (x-right, y-down, z-forward) using the pinhole camera model
@@ -1646,25 +1875,74 @@ class CaveExplorer(Node):
         exclusion check alone. Removing it the moment we learn where the sign actually is closes
         that gap, rather than leaving an already-confirmed ghost to linger for the rest of the
         mission (including being toured as a stop during the science tour).
+
+        A sighting only becomes a remembered position once STOP_SIGN_CONFIRMATION_OBSERVATIONS
+        of them have landed together (see that constant's comment) - until then it's a candidate
+        that neither excludes nor purges anything, so one cascade misfire can't delete a real
+        artefact.
         """
 
-        for existing in self.stop_sign_positions_:
+        for index, existing in enumerate(self.stop_sign_positions_):
             if math.hypot(position.x - existing.x, position.y - existing.y) < STOP_SIGN_EXCLUSION_RADIUS_M:
+                self.stop_sign_counts_[index] += 1
+                self.purge_artifacts_near_stop_sign(index)
                 return
-        self.stop_sign_positions_.append(position)
 
-        ghosts = [c for c in self.artifact_clusters_
-                  if math.hypot(position.x - c['position'].x, position.y - c['position'].y)
-                  < STOP_SIGN_EXCLUSION_RADIUS_M]
-        for ghost in ghosts:
+        candidate = next((c for c in self.stop_sign_candidates_
+                          if math.hypot(position.x - c['position'].x, position.y - c['position'].y)
+                          < STOP_SIGN_EXCLUSION_RADIUS_M), None)
+        if candidate is None:
+            self.stop_sign_candidates_.append({'position': position, 'count': 1})
+            candidate = self.stop_sign_candidates_[-1]
+        else:
+            # Running average, same as add_artifact_observation() does for artefact clusters
+            count = candidate['count']
+            candidate['position'] = Point(
+                x=(candidate['position'].x * count + position.x) / (count + 1),
+                y=(candidate['position'].y * count + position.y) / (count + 1),
+                z=0.0)
+            candidate['count'] = count + 1
+        if candidate['count'] < STOP_SIGN_CONFIRMATION_OBSERVATIONS:
+            return
+
+        self.stop_sign_candidates_.remove(candidate)
+        self.stop_sign_positions_.append(candidate['position'])
+        self.stop_sign_counts_.append(candidate['count'])
+        self.purge_artifacts_near_stop_sign(len(self.stop_sign_positions_) - 1)
+
+    def purge_artifacts_near_stop_sign(self, index):
+        """
+        Perception 3: weigh a remembered stop sign against each artefact cluster within
+        STOP_SIGN_EXCLUSION_RADIUS_M of it, and remove the clusters it out-sees.
+
+        Evidence, not a fixed rule: a cluster goes once the sign has more verified sightings than
+        the cluster has observations. Both earlier rules failed live in opposite directions. Always
+        purging deleted real artefacts the cascade misfired on (the green alien at (18.8, 20.8), green
+        crystals twice) - those false signs had a handful of sightings against a dozen-plus
+        observations of the artefact, so the artefact now wins. Protecting anything the classifier
+        had voted for kept a ghost: a fragment of the real sign at (8.0, 39.4) misread as
+        white_sphere at 0.66-0.86 was confirmed and "inspected" - but a real sign reads 1.00 on
+        dozens of frames as the rover passes, so it now wins. Called on every verified sighting,
+        not just on confirmation, because that's how the real sign's count keeps growing while
+        the ghost's is frozen (observations near a remembered sign are excluded).
+        """
+
+        sign = self.stop_sign_positions_[index]
+        sightings = self.stop_sign_counts_[index]
+        for cluster in [c for c in self.artifact_clusters_
+                        if math.hypot(sign.x - c['position'].x, sign.y - c['position'].y)
+                        < STOP_SIGN_EXCLUSION_RADIUS_M]:
+            if sightings <= cluster.get('num_observations', 0):
+                continue
             self.get_logger().info(
-                f"    STOP SIGN: discarding {ghost['label']} #{ghost['id']} - "
-                f"turned out to be this stop sign")
-            self.artifact_clusters_.remove(ghost)
-            self.visited_artifact_ids_.discard(ghost['id'])
-            self.abandoned_artifact_ids_.discard(ghost['id'])
+                f"    STOP SIGN: discarding {cluster['label']} #{cluster['id']} - "
+                f"turned out to be this stop sign ({sightings} sign sightings vs "
+                f"{cluster.get('num_observations', 0)} observations)")
+            self.artifact_clusters_.remove(cluster)
+            self.visited_artifact_ids_.discard(cluster['id'])
+            self.abandoned_artifact_ids_.discard(cluster['id'])
 
-    def add_artifact_observation(self, label, position):
+    def add_artifact_observation(self, label, position, label_vote=True):
         """
         Perception 3: merge a new observed position for 'label' into an existing nearby cluster
         (running average), or start a new candidate cluster if it's not close to any existing one.
@@ -1718,9 +1996,23 @@ class CaveExplorer(Node):
             best_cluster['position'].z = (best_cluster['position'].z * n + position.z) / (n + 1)
             best_cluster['num_observations'] = n + 1
 
+            # 'label_vote' is False when the classifier was unsure and the raw HSV guess passed
+            # through. Those frames still place the artefact, but don't vote on what it is: HSV
+            # is exactly what confuses green_alien/green_crystals and the pale-blue trio. Live, a
+            # real alien at (54.1, 32.7) was confirmed as green_alien, flipped to green_crystals
+            # 0.4s later on silent HSV-only votes, and the rover diverted to "inspect" it.
+            #
+            # 'label_vote' is also a weight - localise_artifacts() passes the detection's box area,
+            # so close views outvote distant ones. Live, the alien at (54.2, 32.2) was read as
+            # green_crystals from afar on confident-but-wrong frames, correctly as green_alien up
+            # close, then flipped back to green_crystals as the rover drove away and more distant
+            # frames piled up - one vote per frame let quantity beat quality. The classifier was
+            # trained on full-size crops, so a big box is the reading to trust.
             label_votes = best_cluster['label_votes']
-            label_votes[label] = label_votes.get(label, 0) + 1
-            best_cluster['label'] = max(label_votes, key=label_votes.get)
+            if label_vote:
+                label_votes[label] = label_votes.get(label, 0) + label_vote
+            if label_votes:
+                best_cluster['label'] = max(label_votes, key=label_votes.get)
 
             if best_cluster['num_observations'] == ARTIFACT_CONFIRMATION_OBSERVATIONS:
                 self.get_logger().info(
@@ -1738,7 +2030,7 @@ class CaveExplorer(Node):
         self.artifact_clusters_.append({
             'id': cluster_id,
             'label': label,
-            'label_votes': {label: 1},
+            'label_votes': {label: label_vote} if label_vote else {},
             'position': Point(x=position.x, y=position.y, z=position.z),
             'num_observations': 1,
         })
@@ -1932,26 +2224,8 @@ class CaveExplorer(Node):
         """
 
         grid = self.map_grid_
-        height, width = grid.shape
         free = (grid >= 0) & (grid < FRONTIER_OCCUPIED_THRESHOLD)
-
-        dist = np.full((height, width), -1, dtype=np.int32)
-        if not free[start_row, start_col]:
-            return dist
-
-        dist[start_row, start_col] = 0
-        frontier = np.zeros((height, width), dtype=bool)
-        frontier[start_row, start_col] = True
-        d = 0
-        while frontier.any():
-            d += 1
-            expanded = dilate8_mask(frontier) & free & (dist == -1)
-            if not expanded.any():
-                break
-            dist[expanded] = d
-            frontier = expanded
-
-        return dist
+        return wavefront_distance(free, start_row, start_col)
 
     def choose_frontier_goal(self, robot_pose):
         """
@@ -1984,8 +2258,29 @@ class CaveExplorer(Node):
         # this hot path. It has to read the mask *before* the cluster-size and revisit filters
         # below, which describe what is worth driving to rather than what is still unseen -
         # see update_exploration_coverage() for why conflating those two broke exploration.
+        #
+        # The one exception is small frontiers already written off (see
+        # FRONTIER_MAX_FALLBACK_ATTEMPTS): the rover has been there and they're still open, so
+        # they're no evidence of unseen cave, and counting them would block completion forever.
+        written_off = [(a['x'], a['y']) for a in self.fallback_frontier_attempts_
+                       if a['attempts'] >= FRONTIER_MAX_FALLBACK_ATTEMPTS]
+        written_off_mask = points_within_radius_mask(
+            frontier_mask.shape, self.map_origin_, self.map_resolution_,
+            written_off, FRONTIER_FALLBACK_SPOT_RADIUS_M)
+        # Likewise frontier cells inside a known artefact's body: the lidar's single scan plane
+        # passes between crystal/ice spikes and leaves unknown notches there that look like
+        # frontiers but can never be driven into or filled in - see ARTIFACT_PHYSICAL_RADIUS_M.
+        for cluster in self.artifact_clusters_:
+            if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
+                continue
+            radius = ARTIFACT_PHYSICAL_RADIUS_M.get(
+                cluster['label'], ARTIFACT_DEFAULT_PHYSICAL_RADIUS_M)
+            written_off_mask |= points_within_radius_mask(
+                frontier_mask.shape, self.map_origin_, self.map_resolution_,
+                [(cluster['position'].x, cluster['position'].y)], radius)
         self.update_exploration_coverage(measure_exploration_coverage(
-            self.map_grid_, frontier_mask, path_distance_grid, self.map_resolution_))
+            self.map_grid_, frontier_mask, path_distance_grid, self.map_resolution_,
+            written_off_mask=written_off_mask))
 
         # Drop goals older than the revisit window - see FRONTIER_REVISIT_WINDOW_S's comment
         now = self.get_clock().now()
@@ -1996,8 +2291,9 @@ class CaveExplorer(Node):
 
         candidates = []
         for cluster in clusters:
-            if len(cluster) < FRONTIER_MIN_CLUSTER_SIZE:
+            if len(cluster) < FRONTIER_FALLBACK_MIN_CLUSTER_SIZE:
                 continue
+            small = len(cluster) < FRONTIER_MIN_CLUSTER_SIZE
 
             mean_row = sum(r for r, c in cluster) / len(cluster)
             mean_col = sum(c for r, c in cluster) / len(cluster)
@@ -2013,6 +2309,13 @@ class CaveExplorer(Node):
 
             if any(math.hypot(world_x - gx, world_y - gy) < FRONTIER_REVISIT_RADIUS_M
                    for gx, gy, _ in self.recent_frontier_goals_):
+                continue
+            if small and written_off_mask[snap_row, snap_col]:
+                continue
+            # Never send the rover into an artefact. Live, a 6-cell frontier at (21.0, 36.3) -
+            # 1.3m from the centre of the green crystals at (19.8, 35.8), inside its spikes - was
+            # chosen and "reached", and the rover sat wedged among the spikes for over a minute.
+            if not self.is_clear_of_artifacts(world_x, world_y):
                 continue
 
             path_cells = path_distance_grid[snap_row, snap_col]
@@ -2034,6 +2337,7 @@ class CaveExplorer(Node):
                 'distance': distance,
                 'score': score,
                 'reachable': reachable,
+                'small': small,
             })
 
         if not candidates:
@@ -2043,7 +2347,9 @@ class CaveExplorer(Node):
         if not reachable_candidates:
             return None, candidates
 
-        chosen = max(reachable_candidates, key=lambda c: c['score'])
+        # Small frontiers only once no full-size one is left - see FRONTIER_FALLBACK_MIN_CLUSTER_SIZE
+        full_size = [c for c in reachable_candidates if not c['small']]
+        chosen = max(full_size or reachable_candidates, key=lambda c: c['score'])
         return chosen, candidates
 
     def update_exploration_coverage(self, counts):
@@ -2198,6 +2504,14 @@ class CaveExplorer(Node):
         chosen, candidates = self.choose_frontier_goal(robot_pose)
         self.publish_frontier_markers(chosen, candidates)
 
+        # choose_frontier_goal() is also where completeness is measured, so exploration can
+        # finish during this very call. Hand straight back to main_loop for the science tour /
+        # return home rather than sending one last frontier goal - live, that sent the rover on
+        # a 46s detour to a 4-cell scrap right after "EXPLORATION COMPLETE" was logged.
+        if self.exploration_complete_:
+            self.ready_for_next_goal_ = True
+            return
+
         if chosen is None:
             # planner_random_walk() samples directly from the current map bounds, so (unlike
             # planner_random_goal()'s fixed coordinate list) it always finds a valid point even
@@ -2231,8 +2545,28 @@ class CaveExplorer(Node):
 
         # Expires after FRONTIER_REVISIT_WINDOW_S - see that constant's comment for why
         self.recent_frontier_goals_.append((goal_x, goal_y, self.get_clock().now()))
+        if chosen['small']:
+            self.record_fallback_frontier_attempt(goal_x, goal_y, chosen['size'])
 
-        self.planner_go_to_pose2d(goal_pose2d)
+        self.planner_go_to_pose2d(goal_pose2d,
+                                  timeout_s=exploration_goal_timeout_s(chosen['distance']))
+
+    def record_fallback_frontier_attempt(self, x, y, size):
+        """
+        Planning 1: count a goal sent to a small (fallback) frontier at (x, y), so one the rover
+        keeps failing to clear is written off after FRONTIER_MAX_FALLBACK_ATTEMPTS - see there.
+        """
+
+        spot = next((a for a in self.fallback_frontier_attempts_
+                     if math.hypot(x - a['x'], y - a['y']) < FRONTIER_FALLBACK_SPOT_RADIUS_M), None)
+        if spot is None:
+            spot = {'x': x, 'y': y, 'attempts': 0}
+            self.fallback_frontier_attempts_.append(spot)
+        spot['attempts'] += 1
+
+        self.get_logger().info(
+            f'    (no full-size frontiers left - trying a small {size}-cell one at '
+            f'({x:.1f}, {y:.1f}); written off if it is still open afterwards)')
 
     def find_inspection_target(self):
         """
@@ -2245,7 +2579,15 @@ class CaveExplorer(Node):
                 continue
             if cluster['num_observations'] < ARTIFACT_CONFIRMATION_OBSERVATIONS:
                 continue  # not yet confirmed - could still be a one-off false positive
-            if cluster['id'] in self.visited_artifact_ids_ or cluster['id'] in self.abandoned_artifact_ids_:
+            if cluster['id'] in self.visited_artifact_ids_ or cluster['id'] in self.abandoned_artifact_ids_ \
+                    or cluster['id'] in self.dismissed_artifact_ids_:
+                continue
+            if any(c['id'] in self.dismissed_artifact_ids_
+                   and math.hypot(c['position'].x - cluster['position'].x,
+                                  c['position'].y - cluster['position'].y) < ARTIFACT_DUPLICATE_RADIUS_M
+                   for c in self.artifact_clusters_):
+                # A second cluster on an object already found not to be an inspection type
+                self.dismissed_artifact_ids_.add(cluster['id'])
                 continue
             if self.is_duplicate_of_handled_artifact(cluster):
                 # Treat it as the same physical artefact as one we've already dealt with (see
@@ -2467,6 +2809,22 @@ class CaveExplorer(Node):
         self.current_goal_handle_ = None
         self.goal_generation_ += 1
         self.last_goal_succeeded_ = False
+        self.ready_for_next_goal_ = True
+        self.goal_sent_time_ = None
+
+    def accept_goal_as_reached(self):
+        """
+        Planning 2 / Advanced 5: treat the in-flight goal as reached because the rover is close
+        enough and has stopped closing in - see GOAL_CLOSE_ENOUGH_M. Same bookkeeping as
+        abandon_current_goal(), except the goal counts as a success.
+        """
+
+        self.log_goal_outcome(
+            f'close enough ({self.goal_progress_distance_:.1f}m away, stopped closing in)',
+            success=True)
+        self.current_goal_handle_ = None
+        self.goal_generation_ += 1
+        self.last_goal_succeeded_ = True
         self.ready_for_next_goal_ = True
         self.goal_sent_time_ = None
 
@@ -3226,11 +3584,57 @@ class CaveExplorer(Node):
                 f'these will show as pending forever')
 
         self.tour_ = {'stops': stops, 'cost_matrix': cost_matrix, **result}
+        self.tour_['optimised_path'] = self.tour_route_points(stops, result['optimised_order'])
+        self.tour_['baseline_path'] = self.tour_route_points(stops, result['baseline_order'])
         self.tour_stop_index_ = 0
 
         self.log_tour_plan(plan_s)
         self.publish_tour_markers()
         return True
+
+    def tour_route_points(self, stops, order, original_index=None):
+        """
+        Advanced 5 (display only): the closed route through 'order' as map (x, y) points that
+        follow the corridors, so RViz and the GUI show the route the rover actually takes rather
+        than straight lines through rock. Each leg is traced on the occupancy grid keeping clear of
+        walls (see TOUR_ROUTE_CLEARANCES_M), like Nav2 does, instead of hugging them as the plain
+        shortest path would. Leg costs, the visiting order and the driving are unaffected - Nav2
+        still plans the actual path to each stop, so expect it to differ in detail.
+        'original_index' is unused; kept so older callers still work.
+        """
+
+        grid = self.map_grid_
+        free = (grid >= 0) & (grid < FRONTIER_OCCUPIED_THRESHOLD)
+        clearance_m = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 3) * self.map_resolution_
+        near_stop = points_within_radius_mask(
+            free.shape, self.map_origin_, self.map_resolution_,
+            [(stop['x'], stop['y']) for stop in stops], TOUR_ROUTE_STOP_RADIUS_M) & free
+        passable_by_clearance = {r: free & ((clearance_m >= r) | near_stop)
+                                 for r in TOUR_ROUTE_CLEARANCES_M}
+
+        distance_cache = {}
+        points = []
+        for a, b in zip(order, list(order[1:]) + [order[0]]):
+            start = self.world_to_grid(stops[a]['x'], stops[a]['y'])
+            end = self.world_to_grid(stops[b]['x'], stops[b]['y'])
+            cells = []
+            for r in TOUR_ROUTE_CLEARANCES_M:
+                key = (a, r)
+                if key not in distance_cache:
+                    distance_cache[key] = wavefront_distance(passable_by_clearance[r], *start)
+                cells = trace_grid_path(distance_cache[key], *end)
+                if cells:
+                    break
+            if cells:
+                # Every Nth cell plus the leg's own end, so consecutive legs join up exactly
+                leg = [self.grid_to_world(r, c) for r, c in cells[:-1:TOUR_ROUTE_STEP_CELLS]]
+                leg.append(self.grid_to_world(*cells[-1]))
+            else:
+                leg = [(stops[a]['x'], stops[a]['y']), (stops[b]['x'], stops[b]['y'])]
+            if points and points[-1] == leg[0]:
+                leg = leg[1:]
+            points.extend(leg)
+        return points
 
     def log_tour_plan(self, plan_s):
         """
@@ -3329,9 +3733,12 @@ class CaveExplorer(Node):
             line.color.r, line.color.g, line.color.b = color
             # The closing leg back to the first stop is included, because the tour is a closed
             # loop - the rover has to get home - and that leg is part of the cost being compared.
-            for stop_index in list(order) + [order[0]]:
-                stop = stops[stop_index]
-                line.points.append(Point(x=stop['x'], y=stop['y'], z=z))
+            # Drawn along the corridors (see tour_route_points()), not as straight lines.
+            path_key = 'optimised_path' if namespace == 'science_tour_optimised' else 'baseline_path'
+            route = self.tour_.get(path_key) or [
+                (stops[i]['x'], stops[i]['y']) for i in list(order) + [order[0]]]
+            for x, y in route:
+                line.points.append(Point(x=x, y=y, z=z))
             marker_array.markers.append(line)
 
         self.tour_markers_pub_.publish(marker_array)
@@ -3618,7 +4025,12 @@ class CaveExplorer(Node):
 
             stalled_s = (now - self.goal_progress_time_).nanoseconds / 1e9 \
                 if self.goal_progress_time_ is not None else 0.0
-            if elapsed_s > self.goal_timeout_s_:
+            if self.planner_type_ in (PlannerType.INSPECT_ARTIFACT, PlannerType.SCIENCE_TOUR) \
+                    and self.goal_progress_distance_ is not None \
+                    and self.goal_progress_distance_ <= GOAL_CLOSE_ENOUGH_M \
+                    and stalled_s > GOAL_CLOSE_ENOUGH_STALL_S:
+                self.accept_goal_as_reached()
+            elif elapsed_s > self.goal_timeout_s_:
                 self.abandon_current_goal('timed out')
             elif self.planner_type_ not in (PlannerType.RETURN_HOME, PlannerType.SCIENCE_TOUR) \
                     and stalled_s > GOAL_PROGRESS_STALL_S:
@@ -3654,6 +4066,20 @@ class CaveExplorer(Node):
                 self.get_logger().info(
                     f"    (resuming approach to {self.inspection_target_['label']} "
                     f"#{self.inspection_target_['id']} after pause)")
+            elif self.last_goal_succeeded_ \
+                    and self.inspection_target_['label'] not in INSPECTION_ARTIFACT_LABELS:
+                # The approach got close enough for the classifier to see what it really is, and
+                # it isn't an inspection type. Live, the alien at (54.4, 32.7) reads as
+                # green_crystals from afar in every run; the rover diverted, saw the alien up
+                # close, and it was counted as "visited" anyway. Don't count it, and don't let a
+                # later distant misreading send the rover back.
+                self.get_logger().info(
+                    f"    DISMISSED: #{self.inspection_target_['id']} turned out to be "
+                    f"{self.inspection_target_['label']} up close - not an inspection target")
+                self.dismissed_artifact_ids_.add(self.inspection_target_['id'])
+                self.inspection_target_ = None
+                self.inspection_attempts_ = 0
+                self.inspection_instant_failures_ = 0
             elif self.last_goal_succeeded_:
                 self.get_logger().info(
                     f"    DONE: {self.inspection_target_['label']} "
@@ -3781,7 +4207,11 @@ class CaveExplorer(Node):
                        and c['num_observations'] >= ARTIFACT_CONFIRMATION_OBSERVATIONS]
         visited = len(self.visited_artifact_ids_)
         abandoned = len(self.abandoned_artifact_ids_)
-        pending = len(inspectable) - visited - abandoned
+        # Counted directly rather than as inspectable - visited - abandoned: those sets keep ids
+        # of clusters that no longer exist (e.g. purged by remember_stop_sign_position()), which
+        # drove the subtraction negative live (pending=-3).
+        pending = sum(1 for c in inspectable if c['id'] not in self.visited_artifact_ids_
+                      and c['id'] not in self.abandoned_artifact_ids_)
 
         self.get_logger().info(
             f'STATUS   t={elapsed_s:.0f}s   mode={self.planner_type_.name}   '
@@ -3836,7 +4266,11 @@ class CaveExplorer(Node):
                        and c['num_observations'] >= ARTIFACT_CONFIRMATION_OBSERVATIONS]
         visited = len(self.visited_artifact_ids_)
         abandoned = len(self.abandoned_artifact_ids_)
-        pending = len(inspectable) - visited - abandoned
+        # Counted directly rather than as inspectable - visited - abandoned: those sets keep ids
+        # of clusters that no longer exist (e.g. purged by remember_stop_sign_position()), which
+        # drove the subtraction negative live (pending=-3).
+        pending = sum(1 for c in inspectable if c['id'] not in self.visited_artifact_ids_
+                      and c['id'] not in self.abandoned_artifact_ids_)
 
         payload = {
             'mission_started': True,
@@ -3911,6 +4345,7 @@ class CaveExplorer(Node):
             'saved_percent': round(self.tour_['saved_percent'], 1),
             'stop_index': self.tour_stop_index_,
             'complete': self.tour_complete_,
+            'route': [[round(x, 2), round(y, 2)] for x, y in self.tour_.get('optimised_path', [])],
             'stops': [{
                 'position': position + 1,
                 'label': stops[stop_index]['label'],

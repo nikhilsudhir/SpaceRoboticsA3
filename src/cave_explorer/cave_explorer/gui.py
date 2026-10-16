@@ -311,7 +311,13 @@ class MapWidget(QtWidgets.QWidget):
         if self._tour is not None and self._tour['stops']:
             stop_points = [world_to_widget(stop['x'], stop['y']) for stop in self._tour['stops']]
             painter.setPen(QtGui.QPen(QtGui.QColor('#00d4ff'), 1.6))
-            painter.drawPolygon(QtGui.QPolygonF(stop_points))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            route = self._tour.get('route')
+            if route:
+                # Traced along the corridors by the node - see tour_route_points() there
+                painter.drawPolyline(QtGui.QPolygonF([world_to_widget(x, y) for x, y in route]))
+            else:
+                painter.drawPolygon(QtGui.QPolygonF(stop_points))
 
             for stop, point in zip(self._tour['stops'], stop_points):
                 painter.setBrush(QtGui.QColor(TOUR_STOP_COLORS.get(stop['status'], '#00d4ff')))

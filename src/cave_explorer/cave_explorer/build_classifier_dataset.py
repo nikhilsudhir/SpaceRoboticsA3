@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Perception 1 -> Advanced 1 prep: turn the raw, sorted-by-folder dataset frames (whole camera
+Perception 1 -> Perception 2 prep: turn the raw, sorted-by-folder dataset frames (whole camera
 images, one subfolder per artefact label - see README's "Collecting a dataset" section) into
 cropped images ready to upload to Google Teachable Machine (https://teachablemachine.withgoogle.com/),
 one output subfolder per label, matching its expected upload format.

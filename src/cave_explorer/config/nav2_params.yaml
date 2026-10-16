@@ -162,7 +162,19 @@ controller_server:
       yaw_goal_tolerance: 0.5
     # DWB parameters
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
+      # Rotation shim in front of DWB: when the path starts well behind the rover, turn in place
+      # to face it first, then hand over to DWB. DWB alone kept failing that U-turn - every
+      # inspection leaves the rover facing the artefact, and when the next goal was behind it,
+      # live runs logged "Failed to make progress" twice and lost ~40s (after the white sphere
+      # at (46.7, 35.9), and after the green crystals at (19.8, 35.8) in two runs). The DWB
+      # parameters below still apply; the shim reads them as its primary controller's.
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      angular_dist_threshold: 0.785
+      forward_sampling_distance: 0.5
+      rotate_to_heading_angular_vel: 1.0
+      max_angular_accel: 2.0
+      simulate_ahead_time: 1.0
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
@@ -206,7 +218,12 @@ controller_server:
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
-      RotateToGoal.xy_goal_tolerance: 2.0
+      # Must not exceed general_goal_checker's xy_goal_tolerance (1.0). Inside this radius the
+      # critic forbids all forward motion once the robot has slowed, so with the template's 2.0
+      # a robot that stopped 1-2m short could only spin in place, never get within the checker's
+      # 1.0m, and never finish: progress checker "Failed to make progress" twice, then our
+      # watchdog cancelled it. Live, that is how science tour stop 'chamber 9.4m' was missed.
+      RotateToGoal.xy_goal_tolerance: 1.0
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
 

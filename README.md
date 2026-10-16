@@ -75,7 +75,7 @@ Optional, only if you want to manually drive the robot (e.g. while collecting th
 sudo apt install ros-humble-teleop-twist-keyboard
 ```
 
-Optional, only needed for the [trained artefact classifier](#trained-artefact-classifier-advanced-1) - without it, `cave_explorer.py` still runs fine, just without that refinement step (a warning is logged once at startup instead):
+Optional, only needed for the [trained artefact classifier](#trained-artefact-classifier-perception-2) - without it, `cave_explorer.py` still runs fine, just without that refinement step (a warning is logged once at startup instead):
 
 ```bash
 pip install --target ~/.local/share/cave_explorer_tflite tflite-runtime
@@ -174,7 +174,7 @@ Drive the robot around (random walk/goals, waypoints, or teleop — see Percepti
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
 
-Two helper scripts turn that sorted dataset into something usable for training a model (see [Trained artefact classifier](#trained-artefact-classifier-advanced-1) below):
+Two helper scripts turn that sorted dataset into something usable for training a model (see [Trained artefact classifier](#trained-artefact-classifier-perception-2) below):
 
 ```bash
 # First-pass auto-sort of raw, unsorted frames into suggested per-label folders (still needs a manual skim/fix afterwards - see each script's own docstring for details)
@@ -184,7 +184,7 @@ ros2 run cave_explorer sort_dataset_images -- --input ~/cave_dataset --output ~/
 ros2 run cave_explorer build_classifier_dataset -- --input ~/cave_dataset_sorted --output ~/cave_dataset_cropped
 ```
 
-### Trained artefact classifier (Advanced 1)
+### Trained artefact classifier (Perception 2)
 
 Built on top of Perception 2's HSV detection, not a replacement for it: every HSV-detected box is cropped and re-examined by a small trained image classifier, which can confirm the HSV label, correct it (the dataset-sorting process surfaced real, persistent HSV cross-label confusion - e.g. a distant/partially-lit `green_alien` can produce a torso-coloured blob matching `green_crystals`' profile), or reject it outright if the classifier is confident it's actually background (`negative`) - a false positive HSV never should have matched in the first place. See `CLASSIFIER_*` constants and `refine_detections_with_classifier()` in `cave_explorer.py` for the exact logic.
 
