@@ -288,6 +288,76 @@ def find_bottlenecks(clearance_m, smoothed_m, reachable, resolution, count):
     ]
 
 
+def skeleton(free, prune_cells):
+    """
+    Display helper: the free space thinned to a one-cell-wide line down the middle of every
+    corridor and chamber (its skeleton), with branch ends shortened by prune_cells to drop the
+    short stubs thinning leaves in small wall nooks. Returns a boolean mask, or None if this
+    OpenCV build lacks the contrib thinning module (the caller then just skips drawing it).
+    """
+
+    if not hasattr(cv2, 'ximgproc'):
+        return None
+    thin = cv2.ximgproc.thinning(free.astype(np.uint8) * 255,
+                                 thinningType=cv2.ximgproc.THINNING_ZHANGSUEN) > 0
+    kernel = np.ones((3, 3), np.float32)
+    kernel[1, 1] = 0.0
+    for _ in range(prune_cells):
+        neighbours = cv2.filter2D(thin.astype(np.float32), -1, kernel,
+                                  borderType=cv2.BORDER_CONSTANT)
+        ends = thin & (neighbours <= 1.0)
+        if not ends.any():
+            break
+        thin &= ~ends
+    return thin
+
+
+def taper_free_widths(line, width_m, tolerance_m=0.05, max_plateau_cells=2):
+    """
+    Display helper: corridor width along a skeleton ('line', from skeleton()), with the taper at
+    each dead end flattened out. Where a branch runs into a wall, the walls close in over its last
+    stretch, so it always reads as narrow there - even in a wide chamber. Walking in from each
+    branch end while the width keeps rising (allowing max_plateau_cells grid steps without a rise),
+    every cell on that stretch is given the widest value reached. The walk stops as soon as the
+    width levels off or drops, so a narrow corridor of constant width that happens to end at a wall
+    stays narrow, and so does a genuine neck that narrows and then opens up again. Returns a copy
+    of width_m.
+    """
+
+    widths = width_m.copy()
+    height, width = line.shape
+    offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
+
+    def neighbours(row, col):
+        return [(row + dr, col + dc) for dr, dc in offsets
+                if 0 <= row + dr < height and 0 <= col + dc < width and line[row + dr, col + dc]]
+
+    for row, col in zip(*np.nonzero(line)):
+        if len(neighbours(row, col)) != 1:
+            continue  # not a branch end
+        taper = [(row, col)]
+        previous = None
+        current = (row, col)
+        plateau = 0
+        while True:
+            onward = [n for n in neighbours(*current) if n != previous and n not in taper]
+            if len(onward) != 1:
+                break  # reached a junction (or the end of an isolated line)
+            nxt = onward[0]
+            if width_m[nxt] > width_m[current] + tolerance_m:
+                plateau = 0
+            elif width_m[nxt] >= width_m[current] - tolerance_m and plateau < max_plateau_cells:
+                plateau += 1
+            else:
+                break  # levelled off or narrowing again: the taper is over
+            previous, current = current, nxt
+            taper.append(current)
+        top = max(width_m[cell] for cell in taper)
+        for cell in taper:
+            widths[cell] = max(widths[cell], top)
+    return widths
+
+
 def analyse_cave(grid, resolution, reachable, max_features=5):
     """
     Run the full Advanced 2 analysis on the current map.

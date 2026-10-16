@@ -51,7 +51,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import ColorRGBA, String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -218,6 +218,19 @@ def trace_grid_path(distance_grid, end_row, end_col):
         path.append((row, col))
     path.reverse()
     return path
+
+
+def branch_color(width_m):
+    """Advanced 2 (display only): colour for a corridor this wide - see BRANCH_COLOR_STOPS."""
+
+    stops = BRANCH_COLOR_STOPS
+    if width_m <= stops[0][0]:
+        return stops[0][1]
+    for (w0, c0), (w1, c1) in zip(stops, stops[1:]):
+        if width_m <= w1:
+            f = (width_m - w0) / (w1 - w0)
+            return tuple(a + (b - a) * f for a, b in zip(c0, c1))
+    return stops[-1][1]
 
 
 def pose2d_to_pose(pose_2d):
@@ -983,6 +996,21 @@ GEOMETRY_UPDATE_PERIOD_S = 5.0
 # dependent on whatever the widest cell on the current map happens to be (which would make the
 # colours mean something different every update).
 CLEARANCE_DISPLAY_MAX_M = 5.0
+
+# Advanced 2 (display only): chamber rings in RViz - see publish_geometry_markers().
+CHAMBER_COLOR = (1.0, 0.2, 0.8)  # magenta
+CHAMBER_RING_HEADLINE_WIDTH_M = 0.22
+CHAMBER_RING_WIDTH_M = 0.08
+CHAMBER_RING_SEGMENTS = 48
+
+# Advanced 2 (display only): the cave's skeleton drawn as branches, coloured along their length by
+# how wide the cave is there - see publish_geometry_markers(). Colour stops (width in m -> RGB):
+# red when narrow, yellow for ordinary corridor, green in open chambers. Set for this cave, which
+# is mostly far wider than the 1m rover, so all three colours actually appear.
+BRANCH_COLOR_STOPS = ((3.0, (1.0, 0.15, 0.1)), (4.5, (1.0, 0.85, 0.1)), (6.0, (0.15, 0.85, 0.25)))
+BRANCH_WIDTH_M = 0.15
+# Branch ends are trimmed by this many cells (0.3m each) to drop the stubs thinning leaves in nooks
+BRANCH_PRUNE_CELLS = 5
 
 # Advanced 2: features closer together than this (metres) in the geometry analysis are treated
 # as the same place. Mirrors cave_geometry.MIN_FEATURE_SEPARATION_M, and is also used when
@@ -3181,6 +3209,7 @@ class CaveExplorer(Node):
         # widest area and a bottleneck): the science tour draws its stops from these same lists
         # (see collect_science_locations()), so it needs enough candidates to fill a tour from.
         self.geometry_ = cave_geometry.analyse_cave(grid, resolution, reachable, max_features=8)
+        self.geometry_['reachable'] = reachable  # display only - limits the branches to it
 
         self.publish_clearance_map(self.geometry_['clearance_m'], resolution, origin)
         self.publish_geometry_markers(resolution, origin)
@@ -3256,12 +3285,14 @@ class CaveExplorer(Node):
         """
         Advanced 2: draw the detected chambers and bottlenecks in RViz, overlaid on the map.
 
-        Each feature is drawn as a flat disc of exactly the radius the clearance map says fits
-        there, so the marker isn't just a pin on a position - it's a direct visual claim about
-        the geometry ("this circle fits in this chamber") that can be checked by eye against the
-        map underneath it. The best of each kind (widest chamber, narrowest passage) is drawn
-        opaque and labelled with its size; the rest are faint, so the headline answers the task
-        asks for stand out from the supporting detections.
+        Each feature is sized to exactly the radius the clearance map says fits there, so the
+        marker isn't just a pin on a position - it's a direct visual claim about the geometry
+        ("this circle fits in this chamber") that can be checked by eye against the map
+        underneath it. Under it all, the cave's skeleton is drawn as branches coloured by width
+        (red narrow, yellow corridor, green open). Chambers are magenta rings (outlines, so the walls inside stay visible);
+        bottlenecks are flat discs. The best of each kind (widest chamber, narrowest passage) is
+        drawn strongest and labelled with its size; the rest are fainter, so the headline answers
+        the task asks for stand out from the supporting detections.
         """
 
         marker_array = MarkerArray()
@@ -3279,9 +3310,91 @@ class CaveExplorer(Node):
             return (origin[0] + (feature['col'] + 0.5) * resolution,
                     origin[1] + (feature['row'] + 0.5) * resolution)
 
+        # Branches: the cave's skeleton as solid lines, coloured by width along their length -
+        # red where narrow, yellow in ordinary corridor, green in open chambers. Each segment joins
+        # two neighbouring skeleton cells and is coloured at both ends, so colour blends smoothly.
+        clearance_m = self.geometry_['clearance_m']
+        reachable = self.geometry_.get('reachable')
+        free = (clearance_m > 0.0) if reachable is None else (clearance_m > 0.0) & reachable
+        skeleton = cave_geometry.skeleton(free, BRANCH_PRUNE_CELLS)
+        if skeleton is not None and skeleton.any():
+            branches = Marker()
+            branches.header.frame_id = 'map'
+            branches.ns = 'cave_geometry_branches'
+            branches.id = 0
+            branches.type = Marker.LINE_LIST
+            branches.action = Marker.ADD
+            branches.pose.orientation.w = 1.0
+            branches.scale.x = BRANCH_WIDTH_M
+            height, width = skeleton.shape
+            # Dead ends taper as the walls close in, which would otherwise turn every branch tip
+            # red even in a wide chamber - see cave_geometry.taper_free_widths()
+            display_width_m = cave_geometry.taper_free_widths(skeleton, 2.0 * clearance_m)
+
+            def vertex(row, col):
+                point = Point(x=origin[0] + (col + 0.5) * resolution,
+                              y=origin[1] + (row + 0.5) * resolution, z=0.06)
+                r, g, b = branch_color(float(display_width_m[row, col]))
+                return point, ColorRGBA(r=r, g=g, b=b, a=0.95)
+
+            # Forward neighbours only (right, down-left, down, down-right), so each segment is
+            # added once
+            for row, col in zip(*np.nonzero(skeleton)):
+                for d_row, d_col in ((0, 1), (1, -1), (1, 0), (1, 1)):
+                    n_row, n_col = row + d_row, col + d_col
+                    if 0 <= n_row < height and 0 <= n_col < width and skeleton[n_row, n_col]:
+                        for point, color in (vertex(row, col), vertex(n_row, n_col)):
+                            branches.points.append(point)
+                            branches.colors.append(color)
+            if branches.points:
+                marker_array.markers.append(branches)
+
+        # Chambers: a magenta ring of exactly the inscribed circle, not a filled disc, so the walls
+        # inside stay visible and the "this circle fits here" claim can be checked by eye.
+        # Magenta because nothing else on the map uses it (cyan is the tour, green the artefacts,
+        # orange the path, red the bottlenecks). The widest is thick and labelled; the rest thin.
+        for index, chamber in enumerate(self.geometry_['chambers']):
+            x, y = world_of(chamber)
+            radius = chamber['clearance_m']
+            is_headline = (index == 0)
+
+            ring = Marker()
+            ring.header.frame_id = 'map'
+            ring.ns = 'cave_geometry_chamber'
+            ring.id = index
+            ring.type = Marker.LINE_STRIP
+            ring.action = Marker.ADD
+            ring.pose.orientation.w = 1.0
+            ring.scale.x = CHAMBER_RING_HEADLINE_WIDTH_M if is_headline else CHAMBER_RING_WIDTH_M
+            ring.color.a = 1.0 if is_headline else 0.7
+            ring.color.r, ring.color.g, ring.color.b = CHAMBER_COLOR
+            for step in range(CHAMBER_RING_SEGMENTS + 1):
+                angle = 2.0 * math.pi * step / CHAMBER_RING_SEGMENTS
+                ring.points.append(Point(x=x + radius * math.cos(angle),
+                                         y=y + radius * math.sin(angle), z=0.1))
+            marker_array.markers.append(ring)
+
+            if not is_headline:
+                continue
+
+            label = Marker()
+            label.header.frame_id = 'map'
+            label.ns = 'cave_geometry_chamber_label'
+            label.id = index
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            # Just outside the ring, so the text doesn't sit on the circle it describes
+            label.pose.position = Point(x=x, y=y + radius + 0.8, z=1.5)
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.8
+            label.color.a = 1.0
+            label.color.r, label.color.g, label.color.b = CHAMBER_COLOR
+            # Plain ASCII - RViz's font can't draw symbols like a middle dot
+            label.text = f"WIDEST: {chamber['width_m']:.1f} m"
+            marker_array.markers.append(label)
+
         for kind, features, color in (
-                ('chamber', self.geometry_['chambers'], (0.1, 0.9, 0.2)),
-                ('bottleneck', self.geometry_['bottlenecks'], (1.0, 0.2, 0.1))):
+                ('bottleneck', self.geometry_['bottlenecks'], (1.0, 0.2, 0.1)),):
             for index, feature in enumerate(features):
                 x, y = world_of(feature)
                 is_headline = (index == 0)
@@ -3316,10 +3429,7 @@ class CaveExplorer(Node):
                 label.scale.z = 0.8
                 label.color.a = 1.0
                 label.color.r, label.color.g, label.color.b = color
-                if kind == 'chamber':
-                    label.text = f"WIDEST AREA\n{2.0 * feature['clearance_m']:.1f}m across"
-                else:
-                    label.text = f"NARROWEST PASSAGE\n{feature['width_m']:.1f}m wide"
+                label.text = f"NARROWEST PASSAGE\n{feature['width_m']:.1f}m wide"
                 marker_array.markers.append(label)
 
         self.geometry_markers_pub_.publish(marker_array)
