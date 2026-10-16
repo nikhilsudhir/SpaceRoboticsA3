@@ -998,7 +998,7 @@ GEOMETRY_UPDATE_PERIOD_S = 5.0
 CLEARANCE_DISPLAY_MAX_M = 5.0
 
 # Advanced 2 (display only): chamber rings in RViz - see publish_geometry_markers().
-CHAMBER_COLOR = (1.0, 0.2, 0.8)  # magenta
+CHAMBER_COLOR = (0.1, 0.45, 1.0)  # electric blue
 CHAMBER_RING_HEADLINE_WIDTH_M = 0.22
 CHAMBER_RING_WIDTH_M = 0.08
 CHAMBER_RING_SEGMENTS = 48
@@ -1011,6 +1011,10 @@ BRANCH_COLOR_STOPS = ((3.0, (1.0, 0.15, 0.1)), (4.5, (1.0, 0.85, 0.1)), (6.0, (0
 BRANCH_WIDTH_M = 0.15
 # Branch ends are trimmed by this many cells (0.3m each) to drop the stubs thinning leaves in nooks
 BRANCH_PRUNE_CELLS = 5
+# Branch opacity during exploration, and once a science tour has been planned. The tour route is
+# drawn down the same corridors, so the branches fade back to let it be the main thing on screen.
+BRANCH_ALPHA = 0.95
+BRANCH_TOUR_ALPHA = 0.25
 
 # Advanced 2: features closer together than this (metres) in the geometry analysis are treated
 # as the same place. Mirrors cave_geometry.MIN_FEATURE_SEPARATION_M, and is also used when
@@ -3289,8 +3293,9 @@ class CaveExplorer(Node):
         marker isn't just a pin on a position - it's a direct visual claim about the geometry
         ("this circle fits in this chamber") that can be checked by eye against the map
         underneath it. Under it all, the cave's skeleton is drawn as branches coloured by width
-        (red narrow, yellow corridor, green open). Chambers are magenta rings (outlines, so the walls inside stay visible);
-        bottlenecks are flat discs. The best of each kind (widest chamber, narrowest passage) is
+        (red narrow, yellow corridor, green open), fading back once a science tour is planned so
+        the tour route stands out. Chambers are electric blue rings (outlines, so the walls inside
+        stay visible); bottlenecks are flat discs. The best of each kind (widest chamber, narrowest passage) is
         drawn strongest and labelled with its size; the rest are fainter, so the headline answers
         the task asks for stand out from the supporting detections.
         """
@@ -3330,12 +3335,13 @@ class CaveExplorer(Node):
             # Dead ends taper as the walls close in, which would otherwise turn every branch tip
             # red even in a wide chamber - see cave_geometry.taper_free_widths()
             display_width_m = cave_geometry.taper_free_widths(skeleton, 2.0 * clearance_m)
+            alpha = BRANCH_TOUR_ALPHA if getattr(self, 'tour_', None) is not None else BRANCH_ALPHA
 
             def vertex(row, col):
                 point = Point(x=origin[0] + (col + 0.5) * resolution,
                               y=origin[1] + (row + 0.5) * resolution, z=0.06)
                 r, g, b = branch_color(float(display_width_m[row, col]))
-                return point, ColorRGBA(r=r, g=g, b=b, a=0.95)
+                return point, ColorRGBA(r=r, g=g, b=b, a=alpha)
 
             # Forward neighbours only (right, down-left, down, down-right), so each segment is
             # added once
@@ -3349,10 +3355,10 @@ class CaveExplorer(Node):
             if branches.points:
                 marker_array.markers.append(branches)
 
-        # Chambers: a magenta ring of exactly the inscribed circle, not a filled disc, so the walls
-        # inside stay visible and the "this circle fits here" claim can be checked by eye.
-        # Magenta because nothing else on the map uses it (cyan is the tour, green the artefacts,
-        # orange the path, red the bottlenecks). The widest is thick and labelled; the rest thin.
+        # Chambers: an electric blue ring of exactly the inscribed circle, not a filled disc, so the
+        # walls inside stay visible and the "this circle fits here" claim can be checked by eye.
+        # Blue because nothing else on the map uses a strong blue (cyan is the tour, red/yellow/
+        # green the branches, orange the path). The widest is thick and labelled; the rest thin.
         for index, chamber in enumerate(self.geometry_['chambers']):
             x, y = world_of(chamber)
             radius = chamber['clearance_m']

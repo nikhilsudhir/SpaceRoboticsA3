@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for the Advanced 2 RViz drawing of chambers: magenta rings of the inscribed circle, the
+Tests for the Advanced 2 RViz drawing of chambers: electric blue rings of the inscribed circle, the
 widest one thick and labelled. Display only - the analysis itself is tested in
 test_advanced_tasks.py.
 
@@ -31,7 +31,7 @@ def publish(grid, resolution):
     return [m for m in published[0].markers if m.ns]
 
 
-def test_chambers_are_magenta_rings_with_the_widest_labelled():
+def test_chambers_are_blue_rings_with_the_widest_labelled():
     resolution = 0.1
     grid = np.full((80, 150), 100, dtype=np.int8)
     rows, cols = np.indices(grid.shape)
@@ -139,3 +139,25 @@ def test_a_narrow_constant_width_dead_end_corridor_stays_narrow():
     shown = cave_geometry.taper_free_widths(line, width)
 
     assert np.allclose(shown[0, 2:8], 0.7), 'the narrow corridor is not repainted wide'
+
+
+def test_branches_fade_once_a_science_tour_is_planned():
+    if not hasattr(__import__('cv2'), 'ximgproc'):
+        pytest.skip('this OpenCV build has no contrib thinning module')
+    resolution = 0.1
+    grid = np.full((80, 150), 100, dtype=np.int8)
+    rows, cols = np.indices(grid.shape)
+    grid[((cols - 35) ** 2 + (rows - 40) ** 2) <= 32 ** 2] = 0
+    grid[37:44, 60:140] = 0
+
+    def branch_alphas(tour):
+        published = []
+        node = types.SimpleNamespace(
+            geometry_=cave_geometry.analyse_cave(grid, resolution, grid == 0, max_features=3),
+            geometry_markers_pub_=types.SimpleNamespace(publish=published.append), tour_=tour)
+        CaveExplorer.publish_geometry_markers(node, resolution, [0.0, 0.0])
+        [branches] = [m for m in published[0].markers if m.ns == 'cave_geometry_branches']
+        return {round(c.a, 2) for c in branches.colors}
+
+    assert branch_alphas(None) == {cave_explorer.BRANCH_ALPHA}
+    assert branch_alphas({'stops': []}) == {cave_explorer.BRANCH_TOUR_ALPHA}
